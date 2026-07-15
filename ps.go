@@ -5,6 +5,7 @@
 package pdf
 
 import (
+	"context"
 	"fmt"
 	"io"
 )
@@ -53,7 +54,7 @@ func newDict() Value {
 // In the case of a simple stream read only once, otherwise get the length of the stream to handle it properly
 //
 // There is no support for executable blocks, among other limitations.
-func Interpret(strm Value, do func(stk *Stack, op string)) {
+func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) error {
 	var stk Stack
 	var dicts []dict
 	s := strm
@@ -76,6 +77,11 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 
 	Reading:
 		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 			tok := b.readToken()
 			if tok == io.EOF {
 				break
@@ -139,6 +145,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 			stk.Push(Value{nil, objptr{}, obj})
 		}
 	}
+	return nil
 }
 
 type seqReader struct {

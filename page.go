@@ -6,6 +6,7 @@ package pdf
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -60,12 +61,21 @@ func (r *Reader) NumPage() int {
 	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
 }
 
-// GetPlainText returns all the text in the PDF file
-func (r *Reader) GetPlainText() (reader io.Reader, err error) {
+// GetPlainText returns all the text in the PDF file.
+// It checks ctx on each page boundary; callers can cancel mid-extraction.
+func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pages := r.NumPage()
 	var buf bytes.Buffer
 	fonts := make(map[string]*Font)
 	for i := 1; i <= pages; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		p := r.Page(i)
 		for _, name := range p.Fonts() { // cache fonts so we don't continually parse charmap
 			if _, ok := fonts[name]; !ok {
@@ -73,7 +83,7 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 				fonts[name] = &f
 			}
 		}
-		text, err := p.GetPlainText(fonts)
+		text, err := p.GetPlainText(ctx, fonts)
 		if err != nil {
 			return &bytes.Buffer{}, err
 		}
@@ -82,18 +92,30 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	return &buf, nil
 }
 
-// GetStyledTexts returns list all sentences in an array, that are included styles
-func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
+// GetStyledTexts returns all styled text runs in the PDF.
+// It checks ctx on each page boundary; callers can cancel mid-extraction.
+func (r *Reader) GetStyledTexts(ctx context.Context) (sentences []Text, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	totalPage := r.NumPage()
 	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		p := r.Page(pageIndex)
 
 		if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
 			continue
 		}
 		var lastTextStyle Text
-		texts := p.Content().Text
-		for _, text := range texts {
+		content, err := p.Content(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, text := range content.Text {
 			if lastTextStyle == (Text{}) {
 				lastTextStyle = text
 				continue
@@ -386,7 +408,7 @@ func readCmap(toUnicode Value) *cmap {
 	n := -1
 	var m cmap
 	ok := true
-	Interpret(toUnicode, func(stk *Stack, op string) {
+	Interpret(context.Background(), toUnicode, func(stk *Stack, op string) {
 		if !ok {
 			return
 		}
@@ -517,8 +539,9 @@ type gstate struct {
 }
 
 // GetPlainText returns the page's all text without format.
-// fonts can be passed in (to improve parsing performance) or left nil
-func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
+// fonts can be passed in (to improve parsing performance) or left nil.
+// It checks ctx between each PDF operator; cancellation is returned as an error.
+func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
@@ -554,7 +577,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 		}
 	}
 
-	Interpret(strm, func(stk *Stack, op string) {
+	if err := Interpret(ctx, strm, func(stk *Stack, op string) {
 		n := stk.Len()
 		args := make([]Value, n)
 		for i := n - 1; i >= 0; i-- {
@@ -603,7 +626,9 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 				}
 			}
 		}
-	})
+	}); err != nil {
+		return "", err
+	}
 	return textBuilder.String(), nil
 }
 
@@ -767,7 +792,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
-	Interpret(strm, func(stk *Stack, op string) {
+	Interpret(context.Background(), strm, func(stk *Stack, op string) {
 		n := stk.Len()
 		args := make([]Value, n)
 		for i := n - 1; i >= 0; i-- {
@@ -826,10 +851,11 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 }
 
 // Content returns the page's content.
-func (p Page) Content() Content {
+// It checks ctx between each PDF operator; cancellation is returned as an error.
+func (p Page) Content(ctx context.Context) (Content, error) {
 	// Handle in case the content page is empty
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
-		return Content{}
+		return Content{}, nil
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
@@ -866,7 +892,7 @@ func (p Page) Content() Content {
 
 	var rect []Rect
 	var gstack []gstate
-	Interpret(strm, func(stk *Stack, op string) {
+	if err := Interpret(ctx, strm, func(stk *Stack, op string) {
 		n := stk.Len()
 		args := make([]Value, n)
 		for i := n - 1; i >= 0; i-- {
@@ -1047,8 +1073,10 @@ func (p Page) Content() Content {
 			}
 			g.Th = args[0].Float64() / 100
 		}
-	})
-	return Content{text, rect}
+	}); err != nil {
+		return Content{}, err
+	}
+	return Content{text, rect}, nil
 }
 
 // TextVertical implements sort.Interface for sorting
