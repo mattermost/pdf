@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/mattermost/pdf"
 )
 
 func main() {

@@ -26,7 +26,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/mattermost/pdf"
 )
 
 func main() {
@@ -57,7 +57,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/mattermost/pdf"
 )
 
 func main() {
@@ -94,7 +94,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/mattermost/pdf"
 )
 
 func main() {
