@@ -792,7 +792,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
-	Interpret(context.Background(), strm, func(stk *Stack, op string) {
+	_ = Interpret(context.Background(), strm, func(stk *Stack, op string) {
 		n := stk.Len()
 		args := make([]Value, n)
 		for i := n - 1; i >= 0; i-- {
