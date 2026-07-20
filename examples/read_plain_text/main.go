@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/mattermost/pdf"
 )
 
 func main() {
