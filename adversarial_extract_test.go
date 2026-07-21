@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,7 +71,10 @@ func extractWithTimeout(t *testing.T, data []byte, timeout time.Duration) (elaps
 	out, err := r.GetPlainText(ctx)
 	elapsed = time.Since(start)
 	if out != nil {
-		_, _ = bytes.NewBuffer(nil).ReadFrom(out)
+		_, readErr := io.Copy(io.Discard, out)
+		if err == nil {
+			err = readErr
+		}
 	}
 
 	runtime.GC()
@@ -124,6 +128,9 @@ func TestAdversarial_PredictorColumnsBounded(t *testing.T) {
 	if alloc > 8<<20 {
 		t.Fatalf("predictor_columns: allocated %d (want <= 8MiB); err=%v elapsed=%s", alloc, err, elapsed)
 	}
+	if elapsed > 5*time.Millisecond {
+		t.Fatalf("predictor_columns: completed too slowly: elapsed=%s (want <= 5ms); err=%v alloc=%d", elapsed, err, alloc)
+	}
 	t.Logf("predictor_columns: elapsed=%s alloc=%d err=%v", elapsed, alloc, err)
 }
 
@@ -143,8 +150,8 @@ func TestAdversarial_AcroFormStaysCheap(t *testing.T) {
 func TestAdversarial_NestedContentHitsDepthLimit(t *testing.T) {
 	data := loadFixture(t, "nested_content")
 	_, _, err := extractWithTimeout(t, data, 2*time.Second)
-	if err == nil {
-		t.Fatal("nested_content: want nesting-depth error, got nil")
+	if !errors.Is(err, errObjectNestingDepth) {
+		t.Fatalf("nested_content: want nesting-depth error, got %v", err)
 	}
 	t.Logf("nested_content: err=%v", err)
 }

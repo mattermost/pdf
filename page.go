@@ -545,7 +545,11 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result 
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
-			err = errors.New(fmt.Sprint(r))
+			if recoveredErr, ok := r.(error); ok {
+				err = recoveredErr
+			} else {
+				err = errors.New(fmt.Sprint(r))
+			}
 		}
 	}()
 

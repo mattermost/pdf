@@ -18,7 +18,7 @@ printf '%-22s %-10s %-12s %-14s %s\n' "-------" "-------" "-------" "-----------
 probe() {
   local file="$1" timeout="$2"
   local out
-  out="$(go run ./tools/probe_extract.go -timeout "$timeout" "$file" 2>&1)" || true
+  out="$(go run ./tools/probe_extract.go -timeout "$timeout" "$file" 2>&1)"
   local elapsed alloc err
   elapsed="$(echo "$out" | sed -n 's/.*elapsed=\([^ ]*\).*/\1/p' | head -1)"
   alloc="$(echo "$out" | sed -n 's/.*total_alloc_delta=\([0-9]*\).*/\1/p' | head -1)"

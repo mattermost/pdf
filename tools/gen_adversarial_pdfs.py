@@ -273,7 +273,7 @@ SCALES = {
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--outdir", type=Path, default=Path("tools/adversarial_pdfs"))
-    ap.add_argument("--scale", choices=sorted(SCALES), default="small")
+    ap.add_argument("--scale", choices=sorted(SCALES), default="medium")
     ap.add_argument(
         "only",
         nargs="*",

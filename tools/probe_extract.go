@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"time"
@@ -54,8 +55,11 @@ func main() {
 
 	var n int64
 	if out != nil {
-		var buf bytes.Buffer
-		n, _ = buf.ReadFrom(out)
+		var readErr error
+		n, readErr = io.Copy(io.Discard, out)
+		if err == nil {
+			err = readErr
+		}
 	}
 
 	runtime.GC()
@@ -72,4 +76,3 @@ func main() {
 	// allocates, then the filtered reader errors). Exit 0 so scripts can
 	// compare total_alloc_delta across fixtures.
 }
-
