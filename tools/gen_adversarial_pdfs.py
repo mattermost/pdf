@@ -245,7 +245,7 @@ SCALES = {
         "predictor_columns": 5_000_000,     # ~5 MiB alloc ×2
         "many_operators": 10_000,
         "acroform_fields": 1_000,
-        "nested_content": 200,
+        "nested_content": 1_200,            # must exceed maxObjectDepth=1000
     },
     # Default for automated probes: big enough to show gaps, safe on a laptop.
     "medium": {
