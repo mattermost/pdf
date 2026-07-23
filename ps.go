@@ -71,6 +71,7 @@ func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) 
 		rd := s.Reader()
 
 		b := newBuffer(rd, 0)
+		b.ctx = ctx
 		b.allowEOF = true
 		b.allowObjptr = false
 		b.allowStream = false

@@ -7,6 +7,7 @@
 package pdf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -54,7 +55,8 @@ type buffer struct {
 	key         []byte
 	useAES      bool
 	objptr      objptr
-	depth       int // current object nesting depth
+	depth       int             // current object nesting depth
+	ctx         context.Context // when set, reload polls it so long tokens/streams stay cancellable
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -92,6 +94,12 @@ func (b *buffer) errorf(format string, args ...interface{}) {
 }
 
 func (b *buffer) reload() bool {
+	if b.ctx != nil {
+		if err := b.ctx.Err(); err != nil {
+			b.errorf("%w", err)
+			return false
+		}
+	}
 	n := cap(b.buf) - int(b.offset%int64(cap(b.buf)))
 	n, err := b.r.Read(b.buf[:n])
 	if n == 0 && err != nil {
