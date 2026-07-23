@@ -38,6 +38,11 @@ type keyword string
 // a recoverable panic instead of a fatal process crash.
 const maxObjectDepth = 1000
 
+// maxStringBytes caps the per-token allocation in readLiteralString and
+// readHexString. Legitimate strings stay well below this; a malicious huge
+// string would otherwise force an unbounded allocation before any cancel poll.
+const maxStringBytes = 128 * 1024 * 1024 // 128 MiB
+
 var errObjectNestingDepth = errors.New("object nesting exceeds maximum depth")
 
 // A buffer holds buffered input bytes from the PDF file.
@@ -221,6 +226,9 @@ func (b *buffer) readHexString() token {
 			break
 		}
 		tmp = append(tmp, byte(x))
+		if len(tmp) > maxStringBytes {
+			b.errorf("malformed PDF: hex string exceeds %d bytes", maxStringBytes)
+		}
 	}
 	b.tmp = tmp
 	return string(tmp)
@@ -247,6 +255,9 @@ Loop:
 		switch c {
 		default:
 			tmp = append(tmp, c)
+			if len(tmp) > maxStringBytes {
+				b.errorf("malformed PDF: literal string exceeds %d bytes", maxStringBytes)
+			}
 		case '(':
 			depth++
 			tmp = append(tmp, c)
