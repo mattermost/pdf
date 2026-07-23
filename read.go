@@ -854,6 +854,12 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			return zr
 		}
 		columns := param.Key("Columns").Int64()
+		if columns <= 0 {
+			columns = 1 // PDF spec default when Columns is absent
+		}
+		if columns > maxPredictorColumns {
+			panic(fmt.Errorf("malformed PDF: predictor Columns %d out of range", columns))
+		}
 		switch pred.Int64() {
 		default:
 			if DebugOn {
@@ -878,6 +884,11 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		}
 	}
 }
+
+// maxPredictorColumns caps the per-row buffer a Predictor filter allocates.
+// Legitimate rows (image scanlines, xref streams) stay well under this; a
+// malicious huge Columns would otherwise force a ~2×Columns up-front alloc.
+const maxPredictorColumns = 1 << 20
 
 type pngUpReader struct {
 	r    io.Reader
