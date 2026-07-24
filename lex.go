@@ -7,6 +7,7 @@
 package pdf
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -35,6 +36,8 @@ type keyword string
 // "N N obj" tokens to exhaust the Go call stack; this limit turns that into
 // a recoverable panic instead of a fatal process crash.
 const maxObjectDepth = 1000
+
+var errObjectNestingDepth = errors.New("object nesting exceeds maximum depth")
 
 // A buffer holds buffered input bytes from the PDF file.
 type buffer struct {
@@ -419,7 +422,7 @@ func (b *buffer) readObject() object {
 	b.depth++
 	defer func() { b.depth-- }()
 	if b.depth > maxObjectDepth {
-		b.errorf("object nesting exceeds maximum depth %d", maxObjectDepth)
+		b.errorf("%w %d", errObjectNestingDepth, maxObjectDepth)
 		return nil
 	}
 
