@@ -16,7 +16,7 @@ import (
 
 // Desired-behavior tests for cancellation / allocation bounds.
 //
-//	python3 tools/gen_adversarial_pdfs.py -o tools/adversarial_pdfs --scale medium
+//	go run ./tools/gen_adversarial_pdfs -o tools/adversarial_pdfs --scale medium
 //	go test -tags=adversarial -count=1 -v -run Adversarial .
 //
 // Failures mean the implementation does not yet meet the contract for that
