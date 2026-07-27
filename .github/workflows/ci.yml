@@ -2,13 +2,17 @@ name: Go CI
 
 on:
   push:
-    branches: [ "*" ]
+    branches:
+      - master
   pull_request:
-    branches: [ "*" ]
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+
+    env:
+      ADVERSARIAL_PDF_DIR: tools/adversarial_pdfs
+      ADVERSARIAL_PDF_SCALE: large
 
     steps:
     - uses: actions/checkout@v4
@@ -24,6 +28,12 @@ jobs:
 
     - name: Run tests
       run: go test -v ./...
+
+    - name: Generate adversarial fixtures
+      run: go run ./tools/gen_adversarial_pdfs -o $ADVERSARIAL_PDF_DIR --scale $ADVERSARIAL_PDF_SCALE
+
+    - name: Run adversarial tests
+      run: go test -v ./... -tags adversarial
 
     - name: Build
       run: go build -v ./... 

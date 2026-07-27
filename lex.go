@@ -7,6 +7,7 @@
 package pdf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,11 @@ type keyword string
 // a recoverable panic instead of a fatal process crash.
 const maxObjectDepth = 1000
 
+// maxStringBytes caps the per-token allocation in readLiteralString and
+// readHexString. Legitimate strings stay well below this; a malicious huge
+// string would otherwise force an unbounded allocation before any cancel poll.
+const maxStringBytes = 128 * 1024 * 1024 // 128 MiB
+
 var errObjectNestingDepth = errors.New("object nesting exceeds maximum depth")
 
 // A buffer holds buffered input bytes from the PDF file.
@@ -54,7 +60,8 @@ type buffer struct {
 	key         []byte
 	useAES      bool
 	objptr      objptr
-	depth       int // current object nesting depth
+	depth       int             // current object nesting depth
+	ctx         context.Context // when set, reload polls it so long tokens/streams stay cancellable
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -92,6 +99,12 @@ func (b *buffer) errorf(format string, args ...interface{}) {
 }
 
 func (b *buffer) reload() bool {
+	if b.ctx != nil {
+		if err := b.ctx.Err(); err != nil {
+			b.errorf("%w", err)
+			return false
+		}
+	}
 	n := cap(b.buf) - int(b.offset%int64(cap(b.buf)))
 	n, err := b.r.Read(b.buf[:n])
 	if n == 0 && err != nil {
@@ -213,6 +226,9 @@ func (b *buffer) readHexString() token {
 			break
 		}
 		tmp = append(tmp, byte(x))
+		if len(tmp) > maxStringBytes {
+			b.errorf("malformed PDF: hex string exceeds %d bytes", maxStringBytes)
+		}
 	}
 	b.tmp = tmp
 	return string(tmp)
@@ -239,6 +255,9 @@ Loop:
 		switch c {
 		default:
 			tmp = append(tmp, c)
+			if len(tmp) > maxStringBytes {
+				b.errorf("malformed PDF: literal string exceeds %d bytes", maxStringBytes)
+			}
 		case '(':
 			depth++
 			tmp = append(tmp, c)

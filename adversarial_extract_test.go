@@ -16,7 +16,7 @@ import (
 
 // Desired-behavior tests for cancellation / allocation bounds.
 //
-//	python3 tools/gen_adversarial_pdfs.py -o tools/adversarial_pdfs --scale medium
+//	go run ./tools/gen_adversarial_pdfs -o tools/adversarial_pdfs --scale medium
 //	go test -tags=adversarial -count=1 -v -run Adversarial .
 //
 // Failures mean the implementation does not yet meet the contract for that
@@ -140,9 +140,11 @@ func TestAdversarial_AcroFormStaysCheap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPlainText: %v", err)
 	}
-	const maxAlloc = 8 << 20
+	// Allow up to file size + 2 MiB: xref-table parsing is O(object count)
+	// so the threshold must scale with the fixture, not be a fixed constant.
+	maxAlloc := uint64(len(data)) + 2*(1<<20)
 	if alloc > maxAlloc {
-		t.Fatalf("acroform_fields: unexpectedly expensive alloc=%d elapsed=%s", alloc, elapsed)
+		t.Fatalf("acroform_fields: unexpectedly expensive alloc=%d (want <= %d) elapsed=%s", alloc, maxAlloc, elapsed)
 	}
 	t.Logf("acroform_fields: elapsed=%s alloc=%d", elapsed, alloc)
 }
