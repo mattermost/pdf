@@ -255,9 +255,6 @@ Loop:
 		switch c {
 		default:
 			tmp = append(tmp, c)
-			if len(tmp) > maxStringBytes {
-				b.errorf("malformed PDF: literal string exceeds %d bytes", maxStringBytes)
-			}
 		case '(':
 			depth++
 			tmp = append(tmp, c)
@@ -305,6 +302,9 @@ Loop:
 				}
 				tmp = append(tmp, byte(x))
 			}
+		}
+		if len(tmp) > maxStringBytes {
+			b.errorf("malformed PDF: literal string exceeds %d bytes", maxStringBytes)
 		}
 	}
 	b.tmp = tmp
