@@ -30,7 +30,7 @@ func adversarialDir(t *testing.T) string {
 		dir = filepath.Join("tools", "adversarial_pdfs")
 	}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		t.Fatalf("missing fixtures dir %s (run tools/gen_adversarial_pdfs.py first): %v", dir, err)
+		t.Fatalf("missing fixtures dir %s (run `go run ./tools/gen_adversarial_pdfs -o %s` first): %v", dir, dir, err)
 	}
 	return dir
 }
@@ -83,6 +83,84 @@ func extractWithTimeout(t *testing.T, data []byte, timeout time.Duration) (elaps
 	return elapsed, totalAlloc, err
 }
 
+// contentStreamTrigger wraps a file's io.ReaderAt and fires once it observes
+// a run of consecutive, sequentially-offset reads — the signature of the
+// lexer streaming through a stream's bytes (the page content, or a ToUnicode
+// CMap it decodes along the way) rather than the scattered small reads used
+// to resolve the xref table, page tree, and font dictionaries. This gives us
+// a deterministic "parsing has begun and content is being consumed" signal
+// to cancel on, instead of racing an arbitrary wall-clock deadline against
+// unrelated setup cost.
+type contentStreamTrigger struct {
+	r io.ReaderAt
+
+	prevEnd   int64
+	runLen    int
+	fired     bool
+	fireTime  time.Time
+	memAtFire runtime.MemStats
+	cancel    context.CancelFunc
+}
+
+// runLenToFire is the number of consecutive sequential reads required before
+// a run is trusted to be real stream consumption rather than coincidental
+// adjacency between unrelated small reads.
+const runLenToFire = 4
+
+func (c *contentStreamTrigger) ReadAt(p []byte, off int64) (int, error) {
+	n, err := c.r.ReadAt(p, off)
+	if !c.fired && n > 0 {
+		if off == c.prevEnd {
+			c.runLen++
+		} else {
+			c.runLen = 1
+		}
+		c.prevEnd = off + int64(n)
+		if c.runLen >= runLenToFire {
+			c.fired = true
+			c.fireTime = time.Now()
+			runtime.ReadMemStats(&c.memAtFire)
+			c.cancel()
+		}
+	}
+	return n, err
+}
+
+// extractWithContentTrigger cancels GetPlainText's context only once an
+// instrumented reader confirms the lexer is mid-stream through real content,
+// then reports cancellation latency and allocations measured from that point
+// forward — not from process start, so CI scheduling noise before parsing
+// begins can't be mistaken for cancellation cost.
+func extractWithContentTrigger(t *testing.T, data []byte) (cancelLatency time.Duration, allocSinceTrigger uint64, err error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	trigger := &contentStreamTrigger{r: bytes.NewReader(data), cancel: cancel}
+	r, err := NewReader(trigger, int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	out, err := r.GetPlainText(ctx)
+	if out != nil {
+		_, readErr := io.Copy(io.Discard, out)
+		if err == nil {
+			err = readErr
+		}
+	}
+
+	if !trigger.fired {
+		t.Fatalf("instrumented reader never observed a sequential stream read; fixture/test heuristic mismatch, not a cancellation result")
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	cancelLatency = time.Since(trigger.fireTime)
+	allocSinceTrigger = after.TotalAlloc - trigger.memAtFire.TotalAlloc
+	return cancelLatency, allocSinceTrigger, err
+}
+
 func requireCanceledCheaply(t *testing.T, label string, elapsed time.Duration, alloc uint64, err error, maxElapsed time.Duration, maxAlloc uint64) {
 	t.Helper()
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
@@ -99,25 +177,25 @@ func requireCanceledCheaply(t *testing.T, label string, elapsed time.Duration, a
 
 func TestAdversarial_ManyOperatorsCancelsCheaply(t *testing.T) {
 	data := loadFixture(t, "many_operators")
-	elapsed, alloc, err := extractWithTimeout(t, data, 200*time.Microsecond)
+	elapsed, alloc, err := extractWithContentTrigger(t, data)
 	requireCanceledCheaply(t, "many_operators", elapsed, alloc, err, 5*time.Millisecond, 8<<20)
 }
 
 func TestAdversarial_FlateBombCancelsCheaply(t *testing.T) {
 	data := loadFixture(t, "flate_bomb_tj")
-	elapsed, alloc, err := extractWithTimeout(t, data, 200*time.Microsecond)
+	elapsed, alloc, err := extractWithContentTrigger(t, data)
 	requireCanceledCheaply(t, "flate_bomb_tj", elapsed, alloc, err, 5*time.Millisecond, 8<<20)
 }
 
 func TestAdversarial_HugeLiteralCancelsCheaply(t *testing.T) {
 	data := loadFixture(t, "huge_literal_tj")
-	elapsed, alloc, err := extractWithTimeout(t, data, 200*time.Microsecond)
+	elapsed, alloc, err := extractWithContentTrigger(t, data)
 	requireCanceledCheaply(t, "huge_literal_tj", elapsed, alloc, err, 5*time.Millisecond, 8<<20)
 }
 
 func TestAdversarial_ToUnicodeCmapCancelsCheaply(t *testing.T) {
 	data := loadFixture(t, "tounicode_cmap")
-	elapsed, alloc, err := extractWithTimeout(t, data, 200*time.Microsecond)
+	elapsed, alloc, err := extractWithContentTrigger(t, data)
 	requireCanceledCheaply(t, "tounicode_cmap", elapsed, alloc, err, 5*time.Millisecond, 8<<20)
 }
 
