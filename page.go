@@ -438,6 +438,10 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 				return
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				hi, lo := stk.Pop().RawString(), stk.Pop().RawString()
 				if len(lo) == 0 || len(lo) != len(hi) {
 					if DebugOn {
@@ -456,6 +460,10 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 				panic("missing beginbfchar")
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfchar = append(m.bfchar, bfchar{orig, repl})
 			}
@@ -466,6 +474,10 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 				panic("missing beginbfrange")
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
 			}
