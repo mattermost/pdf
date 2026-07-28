@@ -215,13 +215,19 @@ func (f Font) Width(code int) float64 {
 
 // Encoder returns the encoding between font code point sequences and UTF-8.
 func (f Font) Encoder() TextEncoding {
+	return f.encoder(context.Background())
+}
+
+// encoder is like Encoder but honors ctx while parsing a ToUnicode CMap, which
+// can be arbitrarily large in a malicious font.
+func (f Font) encoder(ctx context.Context) TextEncoding {
 	if f.enc == nil { // caching the Encoder so we don't have to continually parse charmap
-		f.enc = f.getEncoder()
+		f.enc = f.getEncoder(ctx)
 	}
 	return f.enc
 }
 
-func (f Font) getEncoder() TextEncoding {
+func (f Font) getEncoder(ctx context.Context) TextEncoding {
 	enc := f.V.Key("Encoding")
 	switch enc.Kind() {
 	case Name:
@@ -231,7 +237,7 @@ func (f Font) getEncoder() TextEncoding {
 		case "MacRomanEncoding":
 			return &byteEncoder{&macRomanEncoding}
 		case "Identity-H":
-			return f.charmapEncoding()
+			return f.charmapEncoding(ctx)
 		default:
 			if DebugOn {
 				println("unknown encoding", enc.Name())
@@ -241,7 +247,7 @@ func (f Font) getEncoder() TextEncoding {
 	case Dict:
 		return &dictEncoder{enc.Key("Differences")}
 	case Null:
-		return f.charmapEncoding()
+		return f.charmapEncoding(ctx)
 	default:
 		if DebugOn {
 			println("unexpected encoding", enc.String())
@@ -250,10 +256,10 @@ func (f Font) getEncoder() TextEncoding {
 	}
 }
 
-func (f *Font) charmapEncoding() TextEncoding {
+func (f *Font) charmapEncoding(ctx context.Context) TextEncoding {
 	toUnicode := f.V.Key("ToUnicode")
 	if toUnicode.Kind() == Stream {
-		m := readCmap(toUnicode)
+		m := readCmap(ctx, toUnicode)
 		if m == nil {
 			return &nopEncoder{}
 		}
@@ -404,11 +410,11 @@ Parse:
 	return string(r)
 }
 
-func readCmap(toUnicode Value) *cmap {
+func readCmap(ctx context.Context, toUnicode Value) *cmap {
 	n := -1
 	var m cmap
 	ok := true
-	Interpret(context.Background(), toUnicode, func(stk *Stack, op string) {
+	Interpret(ctx, toUnicode, func(stk *Stack, op string) {
 		if !ok {
 			return
 		}
@@ -432,6 +438,10 @@ func readCmap(toUnicode Value) *cmap {
 				return
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				hi, lo := stk.Pop().RawString(), stk.Pop().RawString()
 				if len(lo) == 0 || len(lo) != len(hi) {
 					if DebugOn {
@@ -450,6 +460,10 @@ func readCmap(toUnicode Value) *cmap {
 				panic("missing beginbfchar")
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfchar = append(m.bfchar, bfchar{orig, repl})
 			}
@@ -460,6 +474,10 @@ func readCmap(toUnicode Value) *cmap {
 				panic("missing beginbfrange")
 			}
 			for i := 0; i < n; i++ {
+				if err := ctx.Err(); err != nil {
+					ok = false
+					return
+				}
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
 			}
@@ -545,7 +563,11 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result 
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
-			err = errors.New(fmt.Sprint(r))
+			if recoveredErr, ok := r.(error); ok {
+				err = recoveredErr
+			} else {
+				err = errors.New(fmt.Sprint(r))
+			}
 		}
 	}()
 
@@ -598,7 +620,7 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result 
 				panic("bad TL")
 			}
 			if font, ok := fonts[args[0].Name()]; ok {
-				enc = font.Encoder()
+				enc = font.encoder(ctx)
 			} else {
 				enc = &nopEncoder{}
 			}
@@ -852,7 +874,17 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 // Content returns the page's content.
 // It checks ctx between each PDF operator; cancellation is returned as an error.
-func (p Page) Content(ctx context.Context) (Content, error) {
+func (p Page) Content(ctx context.Context) (result Content, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if recoveredErr, ok := r.(error); ok {
+				err = recoveredErr
+			} else {
+				err = errors.New(fmt.Sprint(r))
+			}
+		}
+	}()
+
 	// Handle in case the content page is empty
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
 		return Content{}, nil
@@ -987,7 +1019,7 @@ func (p Page) Content(ctx context.Context) (Content, error) {
 			}
 			f := args[0].Name()
 			g.Tf = p.Font(f)
-			enc = g.Tf.Encoder()
+			enc = g.Tf.encoder(ctx)
 			if enc == nil {
 				if DebugOn {
 					println("no cmap for", f)
