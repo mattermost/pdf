@@ -20,6 +20,8 @@ type Page struct {
 	V Value
 }
 
+const maxTextBytes = 1024 * 1024 * 1 // 1MB
+
 // Page returns the page for the given page number.
 // Page numbers are indexed starting at 1, not 0.
 // If the page is not found, Page returns a Page with p.V.IsNull().
@@ -83,7 +85,11 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 				fonts[name] = &f
 			}
 		}
-		text, err := p.GetPlainText(ctx, fonts)
+		remaining := maxTextBytes - int64(buf.Len())
+		if remaining <= 0 {
+			break
+		}
+		text, err := p.GetPlainText(ctx, fonts, remaining)
 		if err != nil {
 			return &bytes.Buffer{}, err
 		}
@@ -559,7 +565,7 @@ type gstate struct {
 // GetPlainText returns the page's all text without format.
 // fonts can be passed in (to improve parsing performance) or left nil.
 // It checks ctx between each PDF operator; cancellation is returned as an error.
-func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result string, err error) {
+func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit int64) (result string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
@@ -586,12 +592,33 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result 
 		}
 	}
 
+	// Interpret polls ctx on every token, so cancelling it when the cap is
+	// reached stops extraction promptly instead of decoding the whole stream.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	capped := false
+
 	var textBuilder bytes.Buffer
 	showText := func(s string) {
+		if capped {
+			return
+		}
 		textBuilder.WriteString(s)
+		if limit > 0 && int64(textBuilder.Len()) >= limit {
+			capped = true
+			cancel()
+		}
 	}
 	showEncodedText := func(s string) {
+		if capped {
+			return
+		}
 		for _, ch := range enc.Decode(s) {
+			if limit > 0 && int64(textBuilder.Len()) >= limit {
+				capped = true
+				cancel()
+				return
+			}
 			_, err := textBuilder.WriteRune(ch)
 			if err != nil {
 				panic(err)
@@ -649,6 +676,10 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font) (result 
 			}
 		}
 	}); err != nil {
+		// A cap-triggered cancellation is expected; return the partial text.
+		if capped {
+			return textBuilder.String(), nil
+		}
 		return "", err
 	}
 	return textBuilder.String(), nil
