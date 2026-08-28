@@ -2,6 +2,8 @@ package pdf
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"strings"
 	"testing"
 )
@@ -149,5 +151,28 @@ func TestNewReaderMaliciousPDF(t *testing.T) {
 	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
 	if err == nil {
 		t.Fatal("expected error from malicious PDF, got nil")
+	}
+}
+
+// Regression test for https://github.com/ledongthuc/pdf/issues/82:
+// AES-128 encrypted PDFs (V=4, R=4) with /EncryptMetadata false and an empty
+// user password must open successfully instead of returning ErrInvalidPassword.
+func TestOpenEncryptedMetadataFalse(t *testing.T) {
+	f, r, err := Open("testdata/encrypted_metadata_false.pdf")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	b, err := r.GetPlainText(context.Background())
+	if err != nil {
+		t.Fatalf("GetPlainText: %v", err)
+	}
+	text, err := io.ReadAll(b)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !strings.Contains(string(text), "hello world") {
+		t.Fatalf("unexpected text: %q", text)
 	}
 }

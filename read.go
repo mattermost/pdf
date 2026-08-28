@@ -982,6 +982,11 @@ func (r *Reader) initEncrypt(password string) error {
 	h.Write([]byte(O))
 	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
 	h.Write([]byte(ID))
+	if R >= 4 {
+		if encryptMetadata, ok := encrypt["EncryptMetadata"].(bool); ok && !encryptMetadata {
+			h.Write([]byte{0xff, 0xff, 0xff, 0xff})
+		}
+	}
 	key := h.Sum(nil)
 
 	if R >= 3 {
