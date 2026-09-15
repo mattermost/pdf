@@ -79,10 +79,9 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 		default:
 		}
 		p := r.Page(i)
-		for _, name := range p.Fonts() { // cache fonts so we don't continually parse charmap
+		for name, f := range p.fontCache() { // cache fonts so we don't continually parse charmap
 			if _, ok := fonts[name]; !ok {
-				f := p.Font(name)
-				fonts[name] = &f
+				fonts[name] = f
 			}
 		}
 		remaining := maxTextBytes - int64(buf.Len())
@@ -91,7 +90,7 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 		}
 		text, err := p.GetPlainText(ctx, fonts, remaining)
 		if err != nil {
-			return &bytes.Buffer{}, err
+			return nil, err
 		}
 		buf.WriteString(text)
 	}
@@ -176,6 +175,19 @@ func (p Page) Font(name string) Font {
 	return Font{p.Resources().Key("Font").Key(name), nil}
 }
 
+// fontCache returns the page's fonts keyed by name, parsing each font only
+// once so that repeated text operations don't re-parse its charmap.
+func (p Page) fontCache() map[string]*Font {
+	fonts := make(map[string]*Font)
+	for _, name := range p.Fonts() {
+		if _, ok := fonts[name]; !ok {
+			f := p.Font(name)
+			fonts[name] = &f
+		}
+	}
+	return fonts
+}
+
 // A Font represent a font in a PDF file.
 // The methods interpret a Font dictionary stored in V.
 type Font struct {
@@ -220,17 +232,28 @@ func (f Font) Width(code int) float64 {
 }
 
 // Encoder returns the encoding between font code point sequences and UTF-8.
-func (f Font) Encoder() TextEncoding {
+//
+// The receiver is a pointer so the parsed encoding is cached on the Font;
+// with a value receiver the assignment to f.enc would be discarded with the
+// copy, defeating the caching entirely.
+func (f *Font) Encoder() TextEncoding {
 	return f.encoder(context.Background())
 }
 
 // encoder is like Encoder but honors ctx while parsing a ToUnicode CMap, which
 // can be arbitrarily large in a malicious font.
-func (f Font) encoder(ctx context.Context) TextEncoding {
-	if f.enc == nil { // caching the Encoder so we don't have to continually parse charmap
-		f.enc = f.getEncoder(ctx)
+func (f *Font) encoder(ctx context.Context) TextEncoding {
+	if f.enc != nil { // caching the Encoder so we don't have to continually parse charmap
+		return f.enc
 	}
-	return f.enc
+	enc := f.getEncoder(ctx)
+	// Fonts are cached across pages (see Reader.GetPlainText), so a fallback
+	// caused by this call's ctx being cancelled must not be cached: it would
+	// permanently break decoding for later pages that pass a fresh, live ctx.
+	if ctx.Err() == nil {
+		f.enc = enc
+	}
+	return enc
 }
 
 func (f Font) getEncoder(ctx context.Context) TextEncoding {
@@ -244,6 +267,8 @@ func (f Font) getEncoder(ctx context.Context) TextEncoding {
 			return &byteEncoder{&macRomanEncoding}
 		case "Identity-H":
 			return f.charmapEncoding(ctx)
+		case "UniGB-UCS2-H":
+			return &ucs2Encoder{}
 		default:
 			if DebugOn {
 				println("unknown encoding", enc.Name())
@@ -319,6 +344,12 @@ type nopEncoder struct {
 
 func (e *nopEncoder) Decode(raw string) (text string) {
 	return raw
+}
+
+type ucs2Encoder struct{}
+
+func (e *ucs2Encoder) Decode(raw string) (text string) {
+	return utf16Decode(raw)
 }
 
 type byteEncoder struct {
@@ -562,20 +593,50 @@ type gstate struct {
 	CTM   matrix
 }
 
+// popArgs pops every value currently on the stack and returns them with the
+// bottom of the stack at args[0], matching the operand order expected by PDF
+// content-stream operators.
+func popArgs(stk *Stack) []Value {
+	n := stk.Len()
+	args := make([]Value, n)
+	for i := n - 1; i >= 0; i-- {
+		args[i] = stk.Pop()
+	}
+	return args
+}
+
+// recoverTo recovers from a panic raised while parsing PDF content and stores
+// it in err, after calling reset to discard any partially built result. It is
+// meant to be deferred by methods that use panic-based parse error handling.
+//
+// A panic value that is already an error (e.g. a context cancellation wrapped
+// with %w, or errObjectNestingDepth) is kept as-is so callers can still match
+// it with errors.Is; only non-error panics are converted to a plain error.
+func recoverTo(err *error, reset func()) {
+	if r := recover(); r != nil {
+		reset()
+		if e, ok := r.(error); ok {
+			*err = e
+		} else {
+			*err = fmt.Errorf("%v", r)
+		}
+	}
+}
+
+// decodeText decodes raw font code points with enc and returns UTF-8 text.
+func decodeText(enc TextEncoding, raw string) string {
+	var b strings.Builder
+	for _, ch := range enc.Decode(raw) {
+		b.WriteRune(ch)
+	}
+	return b.String()
+}
+
 // GetPlainText returns the page's all text without format.
 // fonts can be passed in (to improve parsing performance) or left nil.
 // It checks ctx between each PDF operator; cancellation is returned as an error.
 func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit int64) (result string, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			result = ""
-			if recoveredErr, ok := r.(error); ok {
-				err = recoveredErr
-			} else {
-				err = errors.New(fmt.Sprint(r))
-			}
-		}
-	}()
+	defer recoverTo(&err, func() { result = "" })
 
 	// Handle in case the content page is empty
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
@@ -585,11 +646,7 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 	var enc TextEncoding = &nopEncoder{}
 
 	if fonts == nil {
-		fonts = make(map[string]*Font)
-		for _, font := range p.Fonts() {
-			f := p.Font(font)
-			fonts[font] = &f
-		}
+		fonts = p.fontCache()
 	}
 
 	// Interpret polls ctx on every token, so cancelling it when the cap is
@@ -627,11 +684,7 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 	}
 
 	if err := Interpret(ctx, strm, func(stk *Stack, op string) {
-		n := stk.Len()
-		args := make([]Value, n)
-		for i := n - 1; i >= 0; i-- {
-			args[i] = stk.Pop()
-		}
+		args := popArgs(stk)
 
 		switch op {
 		default:
@@ -695,28 +748,12 @@ type Column struct {
 type Columns []*Column
 
 // GetTextByColumn returns the page's all text grouped by column
-func (p Page) GetTextByColumn() (Columns, error) {
-	result := Columns{}
-	var err error
-
-	defer func() {
-		if r := recover(); r != nil {
-			result = Columns{}
-			err = errors.New(fmt.Sprint(r))
-		}
-	}()
+func (p Page) GetTextByColumn() (result Columns, err error) {
+	defer recoverTo(&err, func() { result = Columns{} })
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
-		var textBuilder bytes.Buffer
-
-		for _, ch := range enc.Decode(s) {
-			_, err := textBuilder.WriteRune(ch)
-			if err != nil {
-				panic(err)
-			}
-		}
 		text := Text{
-			S: textBuilder.String(),
+			S: decodeText(enc, s),
 			X: currentX,
 			Y: currentY,
 		}
@@ -765,32 +802,12 @@ type Row struct {
 type Rows []*Row
 
 // GetTextByRow returns the page's all text grouped by rows
-func (p Page) GetTextByRow() (Rows, error) {
-	result := Rows{}
-	var err error
-
-	defer func() {
-		if r := recover(); r != nil {
-			result = Rows{}
-			err = errors.New(fmt.Sprint(r))
-		}
-	}()
+func (p Page) GetTextByRow() (result Rows, err error) {
+	defer recoverTo(&err, func() { result = Rows{} })
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
-		var textBuilder bytes.Buffer
-		for _, ch := range enc.Decode(s) {
-			_, err := textBuilder.WriteRune(ch)
-			if err != nil {
-				panic(err)
-			}
-		}
-
-		// if DebugOn {
-		// 	fmt.Println(textBuilder.String())
-		// }
-
 		text := Text{
-			S: textBuilder.String(),
+			S: decodeText(enc, s),
 			X: currentX,
 			Y: currentY,
 		}
@@ -837,20 +854,12 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	strm := p.V.Key("Contents")
 
-	fonts := make(map[string]*Font)
-	for _, font := range p.Fonts() {
-		f := p.Font(font)
-		fonts[font] = &f
-	}
+	fonts := p.fontCache()
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
 	_ = Interpret(context.Background(), strm, func(stk *Stack, op string) {
-		n := stk.Len()
-		args := make([]Value, n)
-		for i := n - 1; i >= 0; i-- {
-			args[i] = stk.Pop()
-		}
+		args := popArgs(stk)
 
 		// if DebugOn {
 		// 	fmt.Println(op, "->", args)
@@ -956,11 +965,7 @@ func (p Page) Content(ctx context.Context) (result Content, err error) {
 	var rect []Rect
 	var gstack []gstate
 	if err := Interpret(ctx, strm, func(stk *Stack, op string) {
-		n := stk.Len()
-		args := make([]Value, n)
-		for i := n - 1; i >= 0; i-- {
-			args[i] = stk.Pop()
-		}
+		args := popArgs(stk)
 		switch op {
 		default:
 			// if DebugOn {
