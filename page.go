@@ -601,10 +601,18 @@ func popArgs(stk *Stack) []Value {
 // recoverTo recovers from a panic raised while parsing PDF content and stores
 // it in err, after calling reset to discard any partially built result. It is
 // meant to be deferred by methods that use panic-based parse error handling.
+//
+// A panic value that is already an error (e.g. a context cancellation wrapped
+// with %w, or errObjectNestingDepth) is kept as-is so callers can still match
+// it with errors.Is; only non-error panics are converted to a plain error.
 func recoverTo(err *error, reset func()) {
 	if r := recover(); r != nil {
 		reset()
-		*err = errors.New(fmt.Sprint(r))
+		if e, ok := r.(error); ok {
+			*err = e
+		} else {
+			*err = fmt.Errorf("%v", r)
+		}
 	}
 }
 

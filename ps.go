@@ -6,6 +6,7 @@ package pdf
 
 import (
 	"context"
+	"errors"
 	"io"
 	"runtime"
 )
@@ -178,8 +179,13 @@ func readObjectRecover(b *buffer) (obj object, ok bool) {
 			// Parse errors are raised with panic(fmt.Errorf(...)) and mean
 			// "discard this operand and keep going". Anything else (nil
 			// deref, index out of range, ...) is a genuine bug and must not
-			// be silently swallowed as malformed input.
+			// be silently swallowed as malformed input. Hitting the object
+			// nesting depth limit is also not "malformed input to discard" —
+			// it's a resource-abuse guard that must keep propagating.
 			if _, isRuntime := r.(runtime.Error); isRuntime {
+				panic(r)
+			}
+			if e, isErr := r.(error); isErr && errors.Is(e, errObjectNestingDepth) {
 				panic(r)
 			}
 			obj, ok = nil, false
