@@ -85,6 +85,33 @@ func TestNewReaderEncryptedStopsOnEmptyPassword(t *testing.T) {
 	}
 }
 
+// selfReferentialPrevXrefPDF builds a minimal PDF whose only xref section's
+// trailer /Prev points back at that same section's own offset, forming a
+// one-entry cycle in the /Prev chain.
+func selfReferentialPrevXrefPDF() []byte {
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	// Padding comment so the file exceeds NewReader's 100-byte EOF lookback
+	// window; it sits before xrefOffset so it doesn't shift any offsets.
+	pdf.WriteString("%" + strings.Repeat("x", 100) + "\n")
+	xrefOffset := pdf.Len()
+	pdf.WriteString("xref\n0 1\n0000000000 65535 f \n")
+	fmt.Fprintf(&pdf, "trailer\n<< /Size 1 /Prev %d >>\n", xrefOffset)
+	fmt.Fprintf(&pdf, "startxref\n%d\n%%%%EOF\n", xrefOffset)
+	return pdf.Bytes()
+}
+
+// TestNewReaderRejectsCyclicPrevXref guards against a self-referential (or
+// otherwise cyclic) xref /Prev chain sending readPrevXrefs into an infinite
+// loop instead of returning a malformed-PDF error.
+func TestNewReaderRejectsCyclicPrevXref(t *testing.T) {
+	data := selfReferentialPrevXrefPDF()
+	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err == nil || !strings.Contains(err.Error(), "revisits offset") {
+		t.Fatalf("err = %v, want xref Prev cycle error", err)
+	}
+}
+
 func TestEnsureXrefLen(t *testing.T) {
 	var table []xref
 	table = ensureXrefLen(table, 3)

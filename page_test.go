@@ -36,6 +36,16 @@ func TestUcs2Encoder(t *testing.T) {
 	}
 }
 
+func TestUcs2EncoderOddLengthAppendsReplacementChar(t *testing.T) {
+	var e ucs2Encoder
+	text := e.Decode(string([]byte{0x00, 0x28, 0xFF}))
+
+	want := "(" + string(noRune)
+	if text != want {
+		t.Errorf("got %q, want %q", text, want)
+	}
+}
+
 func TestNopEncoder(t *testing.T) {
 	e := &nopEncoder{}
 	if got := e.Decode("abc"); got != "abc" {

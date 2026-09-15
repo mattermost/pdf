@@ -222,11 +222,16 @@ func readXref(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 // positioned at the start of each previous section and must return that
 // section's own /Prev entry (or nil) to continue the chain.
 func readPrevXrefs(r *Reader, first object, parse func(b *buffer) (object, error)) error {
+	seen := make(map[int64]bool)
 	for prev := first; prev != nil; {
 		off, ok := prev.(int64)
 		if !ok {
 			return fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prev)
 		}
+		if seen[off] {
+			return fmt.Errorf("malformed PDF: xref Prev chain revisits offset %d", off)
+		}
+		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		next, err := parse(b)
 		if err != nil {

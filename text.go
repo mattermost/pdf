@@ -46,10 +46,15 @@ func isUTF16(s string) bool {
 
 func utf16Decode(s string) string {
 	var u []uint16
-	for i := 0; i < len(s); i += 2 {
+	n := len(s) - len(s)%2
+	for i := 0; i < n; i += 2 {
 		u = append(u, uint16(s[i])<<8|uint16(s[i+1]))
 	}
-	return string(utf16.Decode(u))
+	decoded := string(utf16.Decode(u))
+	if len(s)%2 != 0 {
+		decoded += string(noRune)
+	}
+	return decoded
 }
 
 // See PDF 32000-1:2008, Table D.2

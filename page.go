@@ -243,10 +243,17 @@ func (f *Font) Encoder() TextEncoding {
 // encoder is like Encoder but honors ctx while parsing a ToUnicode CMap, which
 // can be arbitrarily large in a malicious font.
 func (f *Font) encoder(ctx context.Context) TextEncoding {
-	if f.enc == nil { // caching the Encoder so we don't have to continually parse charmap
-		f.enc = f.getEncoder(ctx)
+	if f.enc != nil { // caching the Encoder so we don't have to continually parse charmap
+		return f.enc
 	}
-	return f.enc
+	enc := f.getEncoder(ctx)
+	// Fonts are cached across pages (see Reader.GetPlainText), so a fallback
+	// caused by this call's ctx being cancelled must not be cached: it would
+	// permanently break decoding for later pages that pass a fresh, live ctx.
+	if ctx.Err() == nil {
+		f.enc = enc
+	}
+	return enc
 }
 
 func (f Font) getEncoder(ctx context.Context) TextEncoding {
