@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // A Stack represents a stack of values.
@@ -61,8 +62,17 @@ func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) 
 	var dicts []dict
 	var rd io.Reader
 	if strm.Kind() == Array {
-		readers := make([]io.Reader, 0, strm.Len())
-		for i := 0; i < strm.Len(); i++ {
+		n := strm.Len()
+		readers := make([]io.Reader, 0, 2*n-1)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				// The PDF spec requires content streams in an array to be
+				// treated as if concatenated with a space between each pair,
+				// so a token can't be split across two streams (e.g. "10" at
+				// the end of one and "20" at the start of the next must not
+				// merge into "1020").
+				readers = append(readers, strings.NewReader(" "))
+			}
 			readers = append(readers, strm.Index(i).Reader())
 		}
 		rd = io.MultiReader(readers...)
