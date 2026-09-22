@@ -63,7 +63,7 @@ func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) 
 	var rd io.Reader
 	if strm.Kind() == Array {
 		n := strm.Len()
-		readers := make([]io.Reader, 0, 2*n-1)
+		readers := make([]io.Reader, 0, max(2*n-1, 0))
 		for i := 0; i < n; i++ {
 			if i > 0 {
 				// The PDF spec requires content streams in an array to be

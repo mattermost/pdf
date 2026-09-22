@@ -61,6 +61,52 @@ func TestInterpretSeparatesAdjacentStreamsWithoutWhitespace(t *testing.T) {
 	}
 }
 
+// TestInterpretEmptyContentsArray verifies that Interpret does not panic on a
+// page whose /Contents is an empty array. Before the capacity fix, an empty
+// array made the reader slice's capacity negative (2*0-1 == -1), and make()
+// panicked.
+func TestInterpretEmptyContentsArray(t *testing.T) {
+	pdfData := emptyContentsArrayPDF()
+	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contents := reader.Page(1).V.Key("Contents")
+	called := false
+	err = Interpret(context.Background(), contents, func(stk *Stack, op string) {
+		called = true
+	})
+	if err != nil {
+		t.Fatalf("Interpret: %v", err)
+	}
+	if called {
+		t.Fatal("expected no operators from an empty /Contents array")
+	}
+}
+
+func emptyContentsArrayPDF() []byte {
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, 4)
+	writeObject := func(number int, body string) {
+		offsets[number] = pdf.Len()
+		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
+	}
+
+	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents [] >>")
+
+	xrefOffset := pdf.Len()
+	pdf.WriteString("xref\n0 4\n0000000000 65535 f \n")
+	for number := 1; number <= 3; number++ {
+		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
+	}
+	fmt.Fprintf(&pdf, "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
+	return pdf.Bytes()
+}
+
 func adjacentNumberStreamsPDF() []byte {
 	var pdf bytes.Buffer
 	pdf.WriteString("%PDF-1.4\n")
