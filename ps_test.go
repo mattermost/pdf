@@ -107,6 +107,57 @@ func emptyContentsArrayPDF() []byte {
 	return pdf.Bytes()
 }
 
+// TestInterpretCanceledContextSkipsStreamInitialization verifies that a
+// canceled context stops Interpret before it initializes any of the array's
+// stream readers. Before the ctx check was added to this loop, Interpret
+// called strm.Index(i).Reader() for every stream up front, which runs that
+// stream's decode filters immediately; on an already-canceled context that
+// work (and any cost or panic it triggers) should never happen.
+func TestInterpretCanceledContextSkipsStreamInitialization(t *testing.T) {
+	pdfData := unsupportedFilterContentsArrayPDF()
+	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	contents := reader.Page(1).V.Key("Contents")
+	err = Interpret(ctx, contents, func(stk *Stack, op string) {
+		t.Fatal("operator called on a canceled context")
+	})
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func unsupportedFilterContentsArrayPDF() []byte {
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, 5)
+	writeObject := func(number int, body string) {
+		offsets[number] = pdf.Len()
+		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
+	}
+
+	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents [4 0 R] >>")
+	// /Filter /BogusFilter panics in applyFilter if .Reader() is ever
+	// called on this stream, so its presence here proves whether Interpret
+	// reached stream initialization or bailed out on ctx first.
+	writeObject(4, "<< /Length 1 /Filter /BogusFilter >>\nstream\nx\nendstream")
+
+	xrefOffset := pdf.Len()
+	pdf.WriteString("xref\n0 5\n0000000000 65535 f \n")
+	for number := 1; number <= 4; number++ {
+		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
+	}
+	fmt.Fprintf(&pdf, "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
+	return pdf.Bytes()
+}
+
 func adjacentNumberStreamsPDF() []byte {
 	var pdf bytes.Buffer
 	pdf.WriteString("%PDF-1.4\n")

@@ -65,6 +65,14 @@ func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) 
 		n := strm.Len()
 		readers := make([]io.Reader, 0, max(2*n-1, 0))
 		for i := 0; i < n; i++ {
+			// strm.Index(i).Reader() initializes that stream's decode
+			// filters immediately so check for cancellation before paying 
+			// that cost instead of only after all of them are built.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 			if i > 0 {
 				// The PDF spec requires content streams in an array to be
 				// treated as if concatenated with a space between each pair,
