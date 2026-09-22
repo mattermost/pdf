@@ -54,16 +54,20 @@ func TestUnterminatedArrayTerminates(t *testing.T) {
 		t.Fatalf("NewReader: %v", err)
 	}
 
-	done := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		// The extracted text is irrelevant; the call just has to return.
-		r.GetPlainText(context.Background())
+		_, err := r.GetPlainText(ctx)
+		done <- err
 	}()
 
 	select {
-	case <-done:
-		// ok: extraction terminated
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("GetPlainText: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("GetPlainText did not return within 5s: readArray is looping on io.EOF at end of a truncated content stream")
 	}
