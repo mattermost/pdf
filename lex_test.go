@@ -1,58 +1,29 @@
 package pdf
 
 import (
-	"bytes"
 	"context"
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 )
 
-// buildUnterminatedArrayPDF constructs a minimal single-page PDF whose
-// content stream ends inside an array that is never closed. Real-world
-// truncated or malformed PDFs exhibit the same shape: the tokenizer hits
-// end of input while readArray is still collecting elements.
-func buildUnterminatedArrayPDF() []byte {
-	var buf bytes.Buffer
-	offsets := make([]int, 5)
-
-	buf.WriteString("%PDF-1.4\n")
-
-	// The content stream ends inside "[ ... " with no closing "]".
-	content := "BT /F1 12 Tf [ (hello) 1 2"
-	objs := []string{
-		"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-		"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-		"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>\nendobj\n",
-		fmt.Sprintf("4 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(content), content),
+// TestUnterminatedHexStringTerminates verifies that a content stream ending
+// inside a hex string terminates on its own. readByte returns '\n' at EOF and
+// readHexString skips whitespace, so it spins until the context deadline;
+// GetTextByRow and GetTextByColumn use context.Background() and would never
+// return.
+func TestUnterminatedHexStringTerminates(t *testing.T) {
+	_, err := plainText(t, "5 0 R", "BT /F1 12 Tf <00ab")
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("GetPlainText spun until the deadline on an unterminated hex string")
 	}
-	for i, obj := range objs {
-		offsets[i+1] = buf.Len()
-		buf.WriteString(obj)
-	}
-
-	xrefOffset := buf.Len()
-	buf.WriteString("xref\n0 5\n")
-	buf.WriteString("0000000000 65535 f \n")
-	for i := 1; i <= 4; i++ {
-		fmt.Fprintf(&buf, "%010d 00000 n \n", offsets[i])
-	}
-	buf.WriteString("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n")
-	fmt.Fprintf(&buf, "%d\n%%%%EOF\n", xrefOffset)
-	return buf.Bytes()
 }
 
 // TestUnterminatedArrayTerminates verifies that text extraction terminates
 // on a PDF whose content stream is truncated inside an unterminated array.
-// Before readArray handled io.EOF, readToken returned io.EOF as a token
-// value, which matched neither nil nor keyword("]"), so readArray appended
-// io.EOF objects forever, allocating memory without bound.
+// An unclosed array at EOF must terminate, not loop appending io.EOF.
 func TestUnterminatedArrayTerminates(t *testing.T) {
-	data := buildUnterminatedArrayPDF()
-	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatalf("NewReader: %v", err)
-	}
+	r := newPageReader(t, "/Resources << >> /Contents 4 0 R", streamObj("BT /F1 12 Tf [ (hello) 1 2"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

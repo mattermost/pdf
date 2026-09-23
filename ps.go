@@ -51,44 +51,21 @@ func newDict() Value {
 // in PDF files, such as cmap files that describe the mapping from font code
 // points to Unicode code points.
 //
-// A stream can also be represented by an array of streams; Interpret reads
-// them as a single concatenated token stream, since operators and operands
-// (e.g. array literals for the "TJ" operator) can be split across the
-// individual streams.
+// A stream can also be represented by an array of streams. No token spans two
+// streams, but operators and operands (e.g. array literals for the "TJ"
+// operator) can be split across them, so Interpret reads the streams in
+// order into one operand stack.
 //
 // There is no support for executable blocks, among other limitations.
 func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) error {
 	var stk Stack
 	var dicts []dict
-	var rd io.Reader
+	b := newBuffer(strings.NewReader(""), 0)
 	if strm.Kind() == Array {
-		n := strm.Len()
-		readers := make([]io.Reader, 0, max(2*n-1, 0))
-		for i := 0; i < n; i++ {
-			// strm.Index(i).Reader() initializes that stream's decode
-			// filters immediately so check for cancellation before paying 
-			// that cost instead of only after all of them are built.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			if i > 0 {
-				// The PDF spec requires content streams in an array to be
-				// treated as if concatenated with a space between each pair,
-				// so a token can't be split across two streams (e.g. "10" at
-				// the end of one and "20" at the start of the next must not
-				// merge into "1020").
-				readers = append(readers, strings.NewReader(" "))
-			}
-			readers = append(readers, strm.Index(i).Reader())
-		}
-		rd = io.MultiReader(readers...)
+		b.streams = strm
 	} else {
-		rd = strm.Reader()
+		b.r = strm.Reader()
 	}
-
-	b := newBuffer(rd, 0)
 	b.ctx = ctx
 	b.allowEOF = true
 	b.allowObjptr = false
@@ -103,6 +80,9 @@ Reading:
 		}
 		tok := b.readToken()
 		if tok == io.EOF {
+			if b.nextStream() {
+				continue
+			}
 			break
 		}
 		if kw, ok := tok.(keyword); ok {

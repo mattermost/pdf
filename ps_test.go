@@ -3,18 +3,99 @@ package pdf
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestInterpretContinuesTokensAcrossContentStreams(t *testing.T) {
-	pdfData := splitTextArrayPDF()
-	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
+// buildPagePDF writes a one-page PDF: objects 1-3 are the catalog, page tree
+// and page (with the extra page dict keys in page), and objs are objects 4..
+func buildPagePDF(page string, objs ...string) []byte {
+	objs = append([]string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] " + page + " >>",
+	}, objs...)
+
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objs))
+	for i, obj := range objs {
+		offsets[i] = pdf.Len()
+		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", i+1, obj)
+	}
+	xrefOffset := pdf.Len()
+	fmt.Fprintf(&pdf, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&pdf, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xrefOffset)
+	return pdf.Bytes()
+}
+
+// newPageReader opens the PDF built by buildPagePDF.
+func newPageReader(t *testing.T, page string, objs ...string) *Reader {
+	t.Helper()
+	pdf := buildPagePDF(page, objs...)
+	r, err := NewReader(bytes.NewReader(pdf), int64(len(pdf)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	return r
+}
+
+// plainText extracts a one-page PDF whose /Contents is contents, with /F1
+// (Helvetica) as object 4 and streams as objects 5.. The deadline turns a
+// lexer hang into a test failure instead of a stuck test binary.
+func plainText(t *testing.T, contents string, streams ...string) (string, error) {
+	t.Helper()
+	objs := []string{"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
+	for _, content := range streams {
+		objs = append(objs, streamObj(content))
+	}
+	reader := newPageReader(t, "/Resources << /Font << /F1 4 0 R >> >> /Contents "+contents, objs...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rd, err := reader.GetPlainText(ctx)
+	if err != nil {
+		return "", err
+	}
+	text, err := io.ReadAll(rd)
+	return string(text), err
+}
+
+// interpret runs Interpret, turning a panic into a failure of this test
+// instead of a crash of the whole test binary.
+func interpret(t *testing.T, ctx context.Context, strm Value, do func(stk *Stack, op string)) error {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Interpret panicked: %v", r)
+		}
+	}()
+	return Interpret(ctx, strm, do)
+}
+
+// bogusFilterStream panics in applyFilter if .Reader() is ever called on it,
+// so reaching it proves Interpret opened that stream.
+const bogusFilterStream = "<< /Length 1 /Filter /BogusFilter >>\nstream\nx\nendstream"
+
+// streamObj returns a stream object whose /Length covers exactly content, so
+// no stray byte before "endstream" leaks into the stream.
+func streamObj(content string) string {
+	return fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content)
+}
+
+func TestInterpretContinuesTokensAcrossContentStreams(t *testing.T) {
+	reader := newPageReader(t, "/Resources << /Font << /F1 6 0 R >> >> /Contents [4 0 R 5 0 R]",
+		streamObj("BT /F1 12 Tf 20 100 Td [(Hello)"),
+		streamObj("( world)] TJ ET"),
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	)
 
 	rd, err := reader.GetPlainText(context.Background())
 	if err != nil {
@@ -32,19 +113,18 @@ func TestInterpretContinuesTokensAcrossContentStreams(t *testing.T) {
 // TestInterpretSeparatesAdjacentStreamsWithoutWhitespace verifies that
 // Interpret does not merge tokens across a content-stream array boundary.
 // The first stream ends with "10" (no trailing whitespace) and the second
-// starts with "20" (no leading whitespace); without a separator inserted
-// between the two streams, the lexer would read "1020" as a single number.
+// starts with "20" (no leading whitespace); unless each stream ends at its
+// own EOF, the lexer would read "1020" as a single number.
 func TestInterpretSeparatesAdjacentStreamsWithoutWhitespace(t *testing.T) {
-	pdfData := adjacentNumberStreamsPDF()
-	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := newPageReader(t, "/Resources << >> /Contents [4 0 R 5 0 R]",
+		streamObj("10"),
+		streamObj("20 m"),
+	)
 
 	contents := reader.Page(1).V.Key("Contents")
 	var gotOp string
 	var gotArgs []float64
-	err = Interpret(context.Background(), contents, func(stk *Stack, op string) {
+	err := Interpret(context.Background(), contents, func(stk *Stack, op string) {
 		gotOp = op
 		for stk.Len() > 0 {
 			gotArgs = append([]float64{stk.Pop().Float64()}, gotArgs...)
@@ -62,19 +142,13 @@ func TestInterpretSeparatesAdjacentStreamsWithoutWhitespace(t *testing.T) {
 }
 
 // TestInterpretEmptyContentsArray verifies that Interpret does not panic on a
-// page whose /Contents is an empty array. Before the capacity fix, an empty
-// array made the reader slice's capacity negative (2*0-1 == -1), and make()
-// panicked.
+// page whose /Contents is an empty array.
 func TestInterpretEmptyContentsArray(t *testing.T) {
-	pdfData := emptyContentsArrayPDF()
-	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	reader := newPageReader(t, "/Resources << >> /Contents []")
 
 	contents := reader.Page(1).V.Key("Contents")
 	called := false
-	err = Interpret(context.Background(), contents, func(stk *Stack, op string) {
+	err := Interpret(context.Background(), contents, func(stk *Stack, op string) {
 		called = true
 	})
 	if err != nil {
@@ -85,137 +159,118 @@ func TestInterpretEmptyContentsArray(t *testing.T) {
 	}
 }
 
-func emptyContentsArrayPDF() []byte {
-	var pdf bytes.Buffer
-	pdf.WriteString("%PDF-1.4\n")
-	offsets := make([]int, 4)
-	writeObject := func(number int, body string) {
-		offsets[number] = pdf.Len()
-		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
-	}
-
-	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
-	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents [] >>")
-
-	xrefOffset := pdf.Len()
-	pdf.WriteString("xref\n0 4\n0000000000 65535 f \n")
-	for number := 1; number <= 3; number++ {
-		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
-	}
-	fmt.Fprintf(&pdf, "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
-	return pdf.Bytes()
-}
-
-// TestInterpretCanceledContextSkipsStreamInitialization verifies that a
-// canceled context stops Interpret before it initializes any of the array's
-// stream readers. Before the ctx check was added to this loop, Interpret
-// called strm.Index(i).Reader() for every stream up front, which runs that
-// stream's decode filters immediately; on an already-canceled context that
-// work (and any cost or panic it triggers) should never happen.
-func TestInterpretCanceledContextSkipsStreamInitialization(t *testing.T) {
-	pdfData := unsupportedFilterContentsArrayPDF()
-	reader, err := NewReader(bytes.NewReader(pdfData), int64(len(pdfData)))
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestInterpretOpensArrayStreamsLazily verifies that Interpret opens each
+// stream of a /Contents array only once the previous one is exhausted, so a
+// cancellation raised while parsing (request timeout, output limit) stops it
+// before later streams allocate their decode state.
+func TestInterpretOpensArrayStreamsLazily(t *testing.T) {
+	reader := newPageReader(t, "/Resources << >> /Contents [4 0 R 5 0 R]",
+		// The trailing newline ends the "q" token inside stream 4, so the
+		// lexer never needs to read into stream 5 to dispatch it.
+		streamObj("q\n"),
+		bogusFilterStream,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 
 	contents := reader.Page(1).V.Key("Contents")
-	err = Interpret(ctx, contents, func(stk *Stack, op string) {
-		t.Fatal("operator called on a canceled context")
+	var ops []string
+	err := Interpret(ctx, contents, func(stk *Stack, op string) {
+		ops = append(ops, op)
+		cancel()
 	})
 	if err != context.Canceled {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
+	if len(ops) != 1 || ops[0] != "q" {
+		t.Fatalf("ops = %v, want [q]", ops)
+	}
 }
 
-func unsupportedFilterContentsArrayPDF() []byte {
-	var pdf bytes.Buffer
-	pdf.WriteString("%PDF-1.4\n")
-	offsets := make([]int, 5)
-	writeObject := func(number int, body string) {
-		offsets[number] = pdf.Len()
-		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
+// TestInterpretStreamBoundaries verifies that a malformed tail in one
+// /Contents stream, or an entry that isn't a stream, does not lose the text
+// of the surrounding streams. The spec only allows stream breaks at token
+// boundaries, so comments, strings and arrays left open at the end of a
+// stream must not swallow the next one.
+func TestInterpretStreamBoundaries(t *testing.T) {
+	const a, b = "BT /F1 12 Tf (A) Tj ET", "BT /F1 12 Tf (B) Tj ET"
+	tests := []struct {
+		name     string
+		contents string
+		streams  []string
+	}{
+		{"comment without EOL", "[5 0 R 6 0 R]", []string{a + " % note", b}},
+		{"unterminated string", "[5 0 R 6 0 R]", []string{a + " (x", b}},
+		{"unclosed array", "[5 0 R 6 0 R]", []string{a + " [ (x)", b}},
+		{"null entry", "[5 0 R null 6 0 R]", []string{a, b}},
+		{"dangling reference", "[5 0 R 99 0 R 6 0 R]", []string{a, b}},
 	}
-
-	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
-	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents [4 0 R] >>")
-	// /Filter /BogusFilter panics in applyFilter if .Reader() is ever
-	// called on this stream, so its presence here proves whether Interpret
-	// reached stream initialization or bailed out on ctx first.
-	writeObject(4, "<< /Length 1 /Filter /BogusFilter >>\nstream\nx\nendstream")
-
-	xrefOffset := pdf.Len()
-	pdf.WriteString("xref\n0 5\n0000000000 65535 f \n")
-	for number := 1; number <= 4; number++ {
-		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			text, err := plainText(t, tt.contents, tt.streams...)
+			if err != nil {
+				t.Fatalf("GetPlainText: %v", err)
+			}
+			if !strings.Contains(text, "A") || !strings.Contains(text, "B") {
+				t.Fatalf("text = %q, want both A and B", text)
+			}
+		})
 	}
-	fmt.Fprintf(&pdf, "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
-	return pdf.Bytes()
 }
 
-func adjacentNumberStreamsPDF() []byte {
-	var pdf bytes.Buffer
-	pdf.WriteString("%PDF-1.4\n")
-	offsets := make([]int, 6)
-	writeObject := func(number int, body string) {
-		offsets[number] = pdf.Len()
-		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
-	}
+// TestInterpretPreCanceledContext verifies that Interpret returns
+// context.Canceled without opening any stream when ctx is already canceled.
+func TestInterpretPreCanceledContext(t *testing.T) {
+	reader := newPageReader(t, "/Resources << >> /Contents [4 0 R]", bogusFilterStream)
 
-	// The writeStream helper in splitTextArrayPDF below sets each stream's
-	// /Length one byte past len(content), which captures the "\n" written
-	// between the content and "endstream" as trailing stream content. That
-	// would mask the bug under test by giving every stream an implicit
-	// trailing whitespace byte, so these two streams set their own exact
-	// /Length instead, leaving no whitespace on either side of the boundary.
-	writeExactStream := func(number int, content string) {
-		writeObject(number, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content))
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
-	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents [4 0 R 5 0 R] >>")
-	writeExactStream(4, "10")
-	writeExactStream(5, "20 m")
-
-	xrefOffset := pdf.Len()
-	pdf.WriteString("xref\n0 6\n0000000000 65535 f \n")
-	for number := 1; number <= 5; number++ {
-		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
+	err := interpret(t, ctx, reader.Page(1).V.Key("Contents"), func(stk *Stack, op string) {
+		t.Fatal("operator called on a canceled context")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	fmt.Fprintf(&pdf, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
-	return pdf.Bytes()
 }
 
-func splitTextArrayPDF() []byte {
-	var pdf bytes.Buffer
-	pdf.WriteString("%PDF-1.4\n")
-	offsets := make([]int, 7)
-	writeObject := func(number int, body string) {
-		offsets[number] = pdf.Len()
-		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
+// cancelOnReadAt cancels a context the first time offset off is read, so a
+// test can cancel at an exact byte of the file instead of racing a timer.
+type cancelOnReadAt struct {
+	r      io.ReaderAt
+	off    int64
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnReadAt) ReadAt(p []byte, off int64) (int, error) {
+	if off == c.off {
+		c.cancel()
 	}
-	writeStream := func(number int, content string) {
-		writeObject(number, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content)+1, content))
+	return c.r.ReadAt(p, off)
+}
+
+// TestInterpretReturnsCancelDuringTokenRead verifies that a cancellation
+// landing while the lexer is mid-token is returned by Interpret as an error,
+// not raised as a panic, and that the next stream is never opened. Stream 4
+// is a bare "q", so the lexer must read past the stream boundary to finish
+// the token, and ctx is canceled as stream 4's bytes are read.
+func TestInterpretReturnsCancelDuringTokenRead(t *testing.T) {
+	pdf := buildPagePDF("/Resources << >> /Contents [4 0 R 5 0 R]", streamObj("q"), bogusFilterStream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	trigger := &cancelOnReadAt{
+		r:      bytes.NewReader(pdf),
+		off:    int64(bytes.Index(pdf, []byte("stream\nq\n")) + len("stream\n")),
+		cancel: cancel,
+	}
+	reader, err := NewReader(trigger, int64(len(pdf)))
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
-	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-	writeObject(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 6 0 R >> >> /Contents [4 0 R 5 0 R] >>")
-	writeStream(4, "BT /F1 12 Tf 20 100 Td [(Hello)")
-	writeStream(5, "( world)] TJ ET")
-	writeObject(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-
-	xrefOffset := pdf.Len()
-	pdf.WriteString("xref\n0 7\n0000000000 65535 f \n")
-	for number := 1; number <= 6; number++ {
-		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
+	err = interpret(t, ctx, reader.Page(1).V.Key("Contents"), func(stk *Stack, op string) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	fmt.Fprintf(&pdf, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
-	return pdf.Bytes()
 }

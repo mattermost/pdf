@@ -62,6 +62,24 @@ type buffer struct {
 	objptr      objptr
 	depth       int             // current object nesting depth
 	ctx         context.Context // when set, reload polls it so long tokens/streams stay cancellable
+	streams     Value           // content-stream array read one stream at a time; see nextStream
+	streamIdx   int             // index in streams of the next stream to open
+}
+
+// nextStream switches b to the next stream of b.streams once the current one
+// hits EOF, reporting false when none remain. Each stream ends in its own EOF,
+// so no token spans two streams (as the PDF spec requires), while the object
+// readers call this to let an operand such as a TJ array continue into the
+// next stream. Opening each stream only when it's reached keeps at most one
+// decoder (zlib window, predictor rows) alive at a time.
+func (b *buffer) nextStream() bool {
+	if b.streamIdx >= b.streams.Len() {
+		return false
+	}
+	b.r = b.streams.Index(b.streamIdx).Reader()
+	b.streamIdx++
+	b.eof = false
+	return true
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -502,13 +520,22 @@ func (b *buffer) readArray() object {
 	var x array
 	for {
 		tok := b.readToken()
-		// Break on io.EOF as well (readToken returns io.EOF as a token value
-		// once the input is exhausted, and readDict already guards for it):
-		// otherwise an array that is never closed, e.g. in a truncated
-		// content stream, loops forever appending io.EOF objects and
-		// allocates memory without bound.
+		if tok == io.EOF && b.nextStream() {
+			continue
+		}
+		// readToken yields io.EOF as a value; without this an unclosed array loops forever.
 		if tok == nil || tok == io.EOF || tok == keyword("]") {
 			break
+		}
+		if kw, ok := tok.(keyword); ok {
+			switch kw {
+			case "null", "[", "<<", ">>":
+			default:
+				// An operator can't be an array element, so the array was
+				// never closed; end it and leave the operator to the caller.
+				b.unreadToken(tok)
+				return x
+			}
 		}
 		b.unreadToken(tok)
 		x = append(x, b.readObject())
@@ -524,6 +551,9 @@ func (b *buffer) readDict() object {
 			break
 		}
 		if tok == io.EOF {
+			if b.nextStream() {
+				continue
+			}
 			tok = b.readToken()
 			break
 		}
