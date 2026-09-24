@@ -70,11 +70,14 @@ type buffer struct {
 // readToken calls it only between tokens, so tokens stop at their stream's EOF
 // while operands, arrays and dicts continue; one decoder is alive at a time.
 func (b *buffer) nextStream() bool {
-	for b.streamIdx < b.streams.Len() {
+	for {
 		if b.ctx != nil {
 			if err := b.ctx.Err(); err != nil {
 				b.errorf("%w", err)
 			}
+		}
+		if b.streamIdx >= b.streams.Len() {
+			return false
 		}
 		s := b.streams.Index(b.streamIdx)
 		b.streamIdx++
@@ -86,12 +89,6 @@ func (b *buffer) nextStream() bool {
 			return true
 		}
 	}
-	if b.ctx != nil {
-		if err := b.ctx.Err(); err != nil {
-			b.errorf("%w", err)
-		}
-	}
-	return false
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
