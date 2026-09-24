@@ -71,6 +71,11 @@ type buffer struct {
 // while operands, arrays and dicts continue; one decoder is alive at a time.
 func (b *buffer) nextStream() bool {
 	for b.streamIdx < b.streams.Len() {
+		if b.ctx != nil {
+			if err := b.ctx.Err(); err != nil {
+				b.errorf("%w", err)
+			}
+		}
 		s := b.streams.Index(b.streamIdx)
 		b.streamIdx++
 		// A null entry or a reference to a missing object resolves to null,
@@ -79,6 +84,11 @@ func (b *buffer) nextStream() bool {
 			b.r = s.Reader()
 			b.eof = false
 			return true
+		}
+	}
+	if b.ctx != nil {
+		if err := b.ctx.Err(); err != nil {
+			b.errorf("%w", err)
 		}
 	}
 	return false

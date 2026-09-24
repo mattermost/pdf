@@ -235,6 +235,38 @@ func TestInterpretPreCanceledContext(t *testing.T) {
 	}
 }
 
+func TestInterpretCanceledWhileSkippingIndirectNulls(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		contents string
+	}{
+		{"before later stream", strings.Repeat("4 0 R ", 64) + "5 0 R"},
+		{"on final entry", "4 0 R"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pdf := buildPagePDF("/Resources << >> /Contents ["+tt.contents+"]", "null", bogusFilterStream)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			trigger := &cancelOnReadAt{
+				r:      bytes.NewReader(pdf),
+				off:    int64(bytes.Index(pdf, []byte("4 0 obj\n"))),
+				cancel: cancel,
+			}
+			reader, err := NewReader(trigger, int64(len(pdf)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = interpret(t, ctx, reader.Page(1).V.Key("Contents"), func(stk *Stack, op string) {
+				t.Fatal("operator called after cancellation")
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled", err)
+			}
+		})
+	}
+}
+
 // TestInterpretContinuesDictAcrossContentStreams verifies that a dict operand
 // split across /Contents streams, at any token boundary, parses as one dict.
 func TestInterpretContinuesDictAcrossContentStreams(t *testing.T) {
