@@ -66,20 +66,22 @@ type buffer struct {
 	streamIdx   int             // index in streams of the next stream to open
 }
 
-// nextStream switches b to the next stream of b.streams once the current one
-// hits EOF, reporting false when none remain. Each stream ends in its own EOF,
-// so no token spans two streams (as the PDF spec requires), while the object
-// readers call this to let an operand such as a TJ array continue into the
-// next stream. Opening each stream only when it's reached keeps at most one
-// decoder (zlib window, predictor rows) alive at a time.
+// nextStream opens the next stream of b.streams at EOF (false when none remain).
+// readToken calls it only between tokens, so tokens stop at their stream's EOF
+// while operands, arrays and dicts continue; one decoder is alive at a time.
 func (b *buffer) nextStream() bool {
-	if b.streamIdx >= b.streams.Len() {
-		return false
+	for b.streamIdx < b.streams.Len() {
+		s := b.streams.Index(b.streamIdx)
+		b.streamIdx++
+		// A null entry or a reference to a missing object resolves to null,
+		// which the spec treats as absent content: skip it.
+		if s.Kind() == Stream {
+			b.r = s.Reader()
+			b.eof = false
+			return true
+		}
 	}
-	b.r = b.streams.Index(b.streamIdx).Reader()
-	b.streamIdx++
-	b.eof = false
-	return true
+	return false
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -175,7 +177,7 @@ func (b *buffer) readToken() token {
 	c := b.readByte()
 	for {
 		if isSpace(c) {
-			if b.eof {
+			if b.eof && !b.nextStream() {
 				return io.EOF
 			}
 			c = b.readByte()
@@ -230,12 +232,20 @@ func (b *buffer) readHexString() token {
 		if c == '>' {
 			break
 		}
+		// readByte reports EOF as whitespace, so an unterminated hex string
+		// would otherwise skip it forever.
 		if isSpace(c) {
+			if b.eof {
+				break
+			}
 			goto Loop
 		}
 	Loop2:
 		c2 := b.readByte()
 		if isSpace(c2) {
+			if b.eof {
+				break
+			}
 			goto Loop2
 		}
 		x := unhex(c)<<4 | unhex(c2)
@@ -520,9 +530,6 @@ func (b *buffer) readArray() object {
 	var x array
 	for {
 		tok := b.readToken()
-		if tok == io.EOF && b.nextStream() {
-			continue
-		}
 		// readToken yields io.EOF as a value; without this an unclosed array loops forever.
 		if tok == nil || tok == io.EOF || tok == keyword("]") {
 			break
@@ -551,9 +558,6 @@ func (b *buffer) readDict() object {
 			break
 		}
 		if tok == io.EOF {
-			if b.nextStream() {
-				continue
-			}
 			tok = b.readToken()
 			break
 		}

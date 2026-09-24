@@ -235,6 +235,32 @@ func TestInterpretPreCanceledContext(t *testing.T) {
 	}
 }
 
+// TestInterpretContinuesDictAcrossContentStreams verifies that a dict operand
+// split across /Contents streams, at any token boundary, parses as one dict.
+func TestInterpretContinuesDictAcrossContentStreams(t *testing.T) {
+	tests := []struct{ name, first, second string }{
+		{"between entries", "/P << /MCID 0", "/K 1 >> BDC"},
+		{"between key and value", "/P << /MCID", "0 /K 1 >> BDC"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newPageReader(t, "/Resources << >> /Contents [4 0 R 5 0 R]", streamObj(tt.first), streamObj(tt.second))
+			var props Value
+			err := interpret(t, context.Background(), reader.Page(1).V.Key("Contents"), func(stk *Stack, op string) {
+				if op == "BDC" {
+					props = stk.Pop()
+				}
+			})
+			if err != nil {
+				t.Fatalf("Interpret: %v", err)
+			}
+			if props.Kind() != Dict || props.Key("MCID").Int64() != 0 || props.Key("K").Int64() != 1 || len(props.Keys()) != 2 {
+				t.Fatalf("BDC properties = %v, want << /MCID 0 /K 1 >>", props)
+			}
+		})
+	}
+}
+
 // cancelOnReadAt cancels a context the first time offset off is read, so a
 // test can cancel at an exact byte of the file instead of racing a timer.
 type cancelOnReadAt struct {

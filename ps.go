@@ -6,7 +6,7 @@ package pdf
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"strings"
 )
@@ -57,7 +57,17 @@ func newDict() Value {
 // order into one operand stack.
 //
 // There is no support for executable blocks, among other limitations.
-func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) error {
+func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) (err error) {
+	defer func() {
+		// The lexer's reload raises cancellation mid-token as a panic; return
+		// it like the cancellation caught between tokens.
+		if r := recover(); r != nil {
+			if e, ok := r.(error); !ok || !errors.Is(e, ctx.Err()) {
+				panic(r)
+			}
+			err = ctx.Err()
+		}
+	}()
 	var stk Stack
 	var dicts []dict
 	b := newBuffer(strings.NewReader(""), 0)
@@ -73,31 +83,16 @@ func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) 
 
 Reading:
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		default:
 		}
 		tok := b.readToken()
 		if tok == io.EOF {
-			if b.nextStream() {
-				continue
-			}
 			break
 		}
 		if kw, ok := tok.(keyword); ok {
 			switch kw {
 			case "null", "[", "]", "<<", ">>":
-				break
-			default:
-				for i := len(dicts) - 1; i >= 0; i-- {
-					if v, ok := dicts[i][name(kw)]; ok {
-						stk.Push(Value{nil, objptr{}, v})
-						continue Reading
-					}
-				}
-				do(&stk, string(kw))
-				continue
 			case "dict":
 				stk.Pop()
 				stk.Push(Value{nil, objptr{}, make(dict)})
@@ -128,7 +123,6 @@ Reading:
 				val := stk.Pop()
 				key, ok := stk.Pop().data.(name)
 				if !ok {
-					// panic(fmt.Sprintf("def of non-name: %+v", stk.Pop().data))
 					// Skip the value if it has key without value
 					continue
 				}
@@ -137,6 +131,15 @@ Reading:
 			case "pop":
 				stk.Pop()
 				continue
+			default:
+				for i := len(dicts) - 1; i >= 0; i-- {
+					if v, ok := dicts[i][name(kw)]; ok {
+						stk.Push(Value{nil, objptr{}, v})
+						continue Reading
+					}
+				}
+				do(&stk, string(kw))
+				continue
 			}
 		}
 		b.unreadToken(tok)
@@ -144,18 +147,4 @@ Reading:
 		stk.Push(Value{nil, objptr{}, obj})
 	}
 	return nil
-}
-
-type seqReader struct {
-	rd     io.Reader
-	offset int64
-}
-
-func (r *seqReader) ReadAt(buf []byte, offset int64) (int, error) {
-	if offset != r.offset {
-		return 0, fmt.Errorf("non-sequential read of stream")
-	}
-	n, err := io.ReadFull(r.rd, buf)
-	r.offset += int64(n)
-	return n, err
 }
