@@ -6,8 +6,9 @@ package pdf
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
+	"strings"
 )
 
 // A Stack represents a stack of values.
@@ -50,115 +51,100 @@ func newDict() Value {
 // in PDF files, such as cmap files that describe the mapping from font code
 // points to Unicode code points.
 //
-// A stream can also be represented by an array of streams that has to be handled as a single stream
-// In the case of a simple stream read only once, otherwise get the length of the stream to handle it properly
+// A stream can also be represented by an array of streams. No token spans two
+// streams, but operators and operands (e.g. array literals for the "TJ"
+// operator) can be split across them, so Interpret reads the streams in
+// order into one operand stack.
 //
 // There is no support for executable blocks, among other limitations.
-func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) error {
+func Interpret(ctx context.Context, strm Value, do func(stk *Stack, op string)) (err error) {
+	defer func() {
+		// The lexer's reload raises cancellation mid-token as a panic; return
+		// it like the cancellation caught between tokens.
+		if r := recover(); r != nil {
+			if e, ok := r.(error); !ok || !errors.Is(e, ctx.Err()) {
+				panic(r)
+			}
+			err = ctx.Err()
+		}
+	}()
 	var stk Stack
 	var dicts []dict
-	s := strm
-	strmlen := 1
+	b := newBuffer(strings.NewReader(""), 0)
 	if strm.Kind() == Array {
-		strmlen = strm.Len()
+		b.streams = strm
+	} else {
+		b.r = strm.Reader()
 	}
+	b.ctx = ctx
+	b.allowEOF = true
+	b.allowObjptr = false
+	b.allowStream = false
 
-	for i := 0; i < strmlen; i++ {
-		if strm.Kind() == Array {
-			s = strm.Index(i)
+Reading:
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-
-		rd := s.Reader()
-
-		b := newBuffer(rd, 0)
-		b.ctx = ctx
-		b.allowEOF = true
-		b.allowObjptr = false
-		b.allowStream = false
-
-	Reading:
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			tok := b.readToken()
-			if tok == io.EOF {
-				break
-			}
-			if kw, ok := tok.(keyword); ok {
-				switch kw {
-				case "null", "[", "]", "<<", ">>":
-					break
-				default:
-					for i := len(dicts) - 1; i >= 0; i-- {
-						if v, ok := dicts[i][name(kw)]; ok {
-							stk.Push(Value{nil, objptr{}, v})
-							continue Reading
-						}
-					}
-					do(&stk, string(kw))
-					continue
-				case "dict":
-					stk.Pop()
-					stk.Push(Value{nil, objptr{}, make(dict)})
-					continue
-				case "currentdict":
-					if len(dicts) == 0 {
-						panic("no current dictionary")
-					}
-					stk.Push(Value{nil, objptr{}, dicts[len(dicts)-1]})
-					continue
-				case "begin":
-					d := stk.Pop()
-					if d.Kind() != Dict {
-						panic("cannot begin non-dict")
-					}
-					dicts = append(dicts, d.data.(dict))
-					continue
-				case "end":
-					if len(dicts) <= 0 {
-						panic("mismatched begin/end")
-					}
-					dicts = dicts[:len(dicts)-1]
-					continue
-				case "def":
-					if len(dicts) <= 0 {
-						panic("def without open dict")
-					}
-					val := stk.Pop()
-					key, ok := stk.Pop().data.(name)
-					if !ok {
-						// panic(fmt.Sprintf("def of non-name: %+v", stk.Pop().data))
-						// Skip the value if it has key without value
-						continue
-					}
-					dicts[len(dicts)-1][key] = val.data
-					continue
-				case "pop":
-					stk.Pop()
+		tok := b.readToken()
+		if tok == io.EOF {
+			break
+		}
+		if kw, ok := tok.(keyword); ok {
+			switch kw {
+			case "null", "[", "]", "<<", ">>":
+			case "dict":
+				stk.Pop()
+				stk.Push(Value{nil, objptr{}, make(dict)})
+				continue
+			case "currentdict":
+				if len(dicts) == 0 {
+					panic("no current dictionary")
+				}
+				stk.Push(Value{nil, objptr{}, dicts[len(dicts)-1]})
+				continue
+			case "begin":
+				d := stk.Pop()
+				if d.Kind() != Dict {
+					panic("cannot begin non-dict")
+				}
+				dicts = append(dicts, d.data.(dict))
+				continue
+			case "end":
+				if len(dicts) <= 0 {
+					panic("mismatched begin/end")
+				}
+				dicts = dicts[:len(dicts)-1]
+				continue
+			case "def":
+				if len(dicts) <= 0 {
+					panic("def without open dict")
+				}
+				val := stk.Pop()
+				key, ok := stk.Pop().data.(name)
+				if !ok {
+					// Skip the value if it has key without value
 					continue
 				}
+				dicts[len(dicts)-1][key] = val.data
+				continue
+			case "pop":
+				stk.Pop()
+				continue
+			default:
+				for i := len(dicts) - 1; i >= 0; i-- {
+					if v, ok := dicts[i][name(kw)]; ok {
+						stk.Push(Value{nil, objptr{}, v})
+						continue Reading
+					}
+				}
+				do(&stk, string(kw))
+				continue
 			}
-			b.unreadToken(tok)
-			obj := b.readObject()
-			stk.Push(Value{nil, objptr{}, obj})
 		}
+		b.unreadToken(tok)
+		obj := b.readObject()
+		stk.Push(Value{nil, objptr{}, obj})
 	}
 	return nil
-}
-
-type seqReader struct {
-	rd     io.Reader
-	offset int64
-}
-
-func (r *seqReader) ReadAt(buf []byte, offset int64) (int, error) {
-	if offset != r.offset {
-		return 0, fmt.Errorf("non-sequential read of stream")
-	}
-	n, err := io.ReadFull(r.rd, buf)
-	r.offset += int64(n)
-	return n, err
 }

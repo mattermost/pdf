@@ -420,7 +420,7 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 	n := -1
 	var m cmap
 	ok := true
-	Interpret(ctx, toUnicode, func(stk *Stack, op string) {
+	err := Interpret(ctx, toUnicode, func(stk *Stack, op string) {
 		if !ok {
 			return
 		}
@@ -498,7 +498,7 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 			}
 		}
 	})
-	if !ok {
+	if err != nil || !ok {
 		return nil
 	}
 	return &m

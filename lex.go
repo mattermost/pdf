@@ -62,6 +62,33 @@ type buffer struct {
 	objptr      objptr
 	depth       int             // current object nesting depth
 	ctx         context.Context // when set, reload polls it so long tokens/streams stay cancellable
+	streams     Value           // content-stream array read one stream at a time; see nextStream
+	streamIdx   int             // index in streams of the next stream to open
+}
+
+// nextStream opens the next stream of b.streams at EOF (false when none remain).
+// readToken calls it only between tokens, so tokens stop at their stream's EOF
+// while operands, arrays and dicts continue; one decoder is alive at a time.
+func (b *buffer) nextStream() bool {
+	for {
+		if b.ctx != nil {
+			if err := b.ctx.Err(); err != nil {
+				b.errorf("%w", err)
+			}
+		}
+		if b.streamIdx >= b.streams.Len() {
+			return false
+		}
+		s := b.streams.Index(b.streamIdx)
+		b.streamIdx++
+		// A null entry or a reference to a missing object resolves to null,
+		// which the spec treats as absent content: skip it.
+		if s.Kind() == Stream {
+			b.r = s.Reader()
+			b.eof = false
+			return true
+		}
+	}
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -157,7 +184,7 @@ func (b *buffer) readToken() token {
 	c := b.readByte()
 	for {
 		if isSpace(c) {
-			if b.eof {
+			if b.eof && !b.nextStream() {
 				return io.EOF
 			}
 			c = b.readByte()
@@ -212,12 +239,20 @@ func (b *buffer) readHexString() token {
 		if c == '>' {
 			break
 		}
+		// readByte reports EOF as whitespace, so an unterminated hex string
+		// would otherwise skip it forever.
 		if isSpace(c) {
+			if b.eof {
+				break
+			}
 			goto Loop
 		}
 	Loop2:
 		c2 := b.readByte()
 		if isSpace(c2) {
+			if b.eof {
+				break
+			}
 			goto Loop2
 		}
 		x := unhex(c)<<4 | unhex(c2)
@@ -502,8 +537,19 @@ func (b *buffer) readArray() object {
 	var x array
 	for {
 		tok := b.readToken()
-		if tok == nil || tok == keyword("]") {
+		// readToken yields io.EOF as a value; without this an unclosed array loops forever.
+		if tok == nil || tok == io.EOF || tok == keyword("]") {
 			break
+		}
+		if kw, ok := tok.(keyword); ok {
+			switch kw {
+			case "null", "[", "<<", ">>":
+			default:
+				// An operator can't be an array element, so the array was
+				// never closed; end it and leave the operator to the caller.
+				b.unreadToken(tok)
+				return x
+			}
 		}
 		b.unreadToken(tok)
 		x = append(x, b.readObject())
