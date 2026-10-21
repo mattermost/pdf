@@ -88,6 +88,7 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+	objStmNest int
 }
 
 type xref struct {
@@ -248,11 +249,16 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
 	}
 
+	seen := map[int64]bool{}
 	for prevoff := strm.hdr["Prev"]; prevoff != nil; {
 		off, ok := prevoff.(int64)
 		if !ok {
 			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
 		}
+		if seen[off] {
+			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev repeats offset %d", off)
+		}
+		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		obj1 := b.readObject()
 		obj, ok := obj1.(objdef)
@@ -378,11 +384,16 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref table not followed by trailer dictionary")
 	}
 
+	seen := map[int64]bool{}
 	for prevoff := trailer["Prev"]; prevoff != nil; {
 		off, ok := prevoff.(int64)
 		if !ok {
 			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
 		}
+		if seen[off] {
+			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev repeats offset %d", off)
+		}
+		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		tok := b.readToken()
 		if tok != keyword("xref") {
@@ -727,6 +738,15 @@ func (v Value) Len() int {
 	return len(x)
 }
 
+// maxObjStmNesting bounds how deep a lookup may descend into object streams:
+// the lookup itself plus one level of header values held in another stream.
+const maxObjStmNesting = 2
+
+// maxObjStmExtends bounds the Extends chain walked for a single lookup. A
+// type-2 xref entry already names the stream holding the object, so a
+// well-formed file needs no hops at all.
+const maxObjStmExtends = 8
+
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	if ptr, ok := x.(objptr); ok {
 		if ptr.id >= uint32(len(r.xref)) {
@@ -738,7 +758,17 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		}
 		var obj object
 		if xref.inStream {
+			r.objStmNest++
+			defer func() { r.objStmNest-- }()
+			if r.objStmNest > maxObjStmNesting {
+				panic(fmt.Errorf("malformed PDF: object stream nesting exceeds %d", maxObjStmNesting))
+			}
+			if xref.stream.id >= uint32(len(r.xref)) || r.xref[xref.stream.id].inStream {
+				panic(fmt.Errorf("malformed PDF: %v names an unusable container object stream", ptr))
+			}
 			strm := r.resolve(parent, xref.stream)
+			seen := map[objptr]bool{}
+			hops := 0
 		Search:
 			for {
 				if strm.Kind() != Stream {
@@ -747,16 +777,29 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				if strm.Key("Type").Name() != "ObjStm" {
 					panic("not an object stream")
 				}
+				if strm.ptr != (objptr{}) {
+					if seen[strm.ptr] {
+						panic(fmt.Errorf("malformed PDF: object stream %v extends itself", strm.ptr))
+					}
+					seen[strm.ptr] = true
+				}
 				n := int(strm.Key("N").Int64())
 				first := strm.Key("First").Int64()
 				if first == 0 {
 					panic("missing First")
 				}
+				if n < 0 || int64(n) > first/2 {
+					panic(fmt.Errorf("malformed PDF: object stream header declares %d objects before offset %d", n, first))
+				}
 				b := newBuffer(strm.Reader(), 0)
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
-					id, _ := b.readToken().(int64)
-					off, _ := b.readToken().(int64)
+					id, ok1 := b.readToken().(int64)
+					off, ok2 := b.readToken().(int64)
+					// The header ends early when either token is not an integer.
+					if !ok1 || !ok2 {
+						break
+					}
 					if uint32(id) == ptr.id {
 						b.seekForward(first + off)
 						x = b.readObject()
@@ -766,6 +809,10 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				ext := strm.Key("Extends")
 				if ext.Kind() != Stream {
 					panic("cannot find object in stream")
+				}
+				hops++
+				if hops > maxObjStmExtends {
+					panic(fmt.Errorf("malformed PDF: object stream Extends chain exceeds %d", maxObjStmExtends))
 				}
 				strm = ext
 			}
