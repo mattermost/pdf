@@ -348,6 +348,52 @@ func TestPageWithSeveralFonts(t *testing.T) {
 	}
 }
 
+func TestInlineFontsInIndirectResources(t *testing.T) {
+	font := func(first string) string {
+		return "<< /Type /Font /Subtype /Type1 /BaseFont /Mapped /Encoding << /Differences [65 /" + first + "] >> >>"
+	}
+	data := buildPagePDF("/Contents 4 0 R /Resources 5 0 R",
+		streamObj("BT /F1 12 Tf (A) Tj /F2 12 Tf (A) Tj ET"),
+		"<< /Font << /F1 "+font("adieresis")+" /F2 "+font("ccedilla")+" >> >>",
+	)
+
+	text, err := extract(t, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(text); got != "äç" {
+		t.Fatalf("text = %q, want %q", got, "äç")
+	}
+}
+
+func TestFontNamesAreScopedToPage(t *testing.T) {
+	font := func(first string) string {
+		return "<< /Type /Font /Subtype /Type1 /BaseFont /Mapped /Encoding << /Differences [65 /" + first + "] >> >>"
+	}
+	page := func(content, font int) string {
+		return fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents %d 0 R /Resources << /Font << /F1 %d 0 R >> >> >>", content, font)
+	}
+	data := classicPDF([]string{
+		"",
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		page(5, 7),
+		page(6, 8),
+		streamObj("BT /F1 12 Tf (A) Tj ET"),
+		streamObj("BT /F1 12 Tf (A) Tj ET"),
+		font("adieresis"),
+		font("ccedilla"),
+	}, "")
+
+	text, err := extract(t, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(strings.Fields(text), ""); got != "äç" {
+		t.Fatalf("text = %q, want %q", got, "äç")
+	}
+}
+
 // manyFontsPDF builds a one-page PDF naming n fonts, each used once.
 func manyFontsPDF(n int) []byte {
 	var names, content bytes.Buffer

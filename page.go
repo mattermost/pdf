@@ -78,7 +78,9 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 	}
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	fonts := make(map[string]*Font)
+	// Font names are scoped to a page, so the cross-page cache is keyed by the
+	// font object and each page gets its own name table.
+	fontCache := make(map[objptr]*Font)
 	for i := 1; i <= pages; i++ {
 		select {
 		case <-ctx.Done():
@@ -86,16 +88,9 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 		default:
 		}
 		p := r.Page(i)
-		// Resolve the page's font dictionary once instead of once per name.
-		fontDict := p.Resources().Key("Font")
-		for _, name := range fontDict.Keys() { // cache fonts so we don't continually parse charmap
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if _, ok := fonts[name]; !ok {
-				f := Font{fontDict.Key(name), nil}
-				fonts[name] = &f
-			}
+		fonts, err := p.fontTable(ctx, fontCache)
+		if err != nil {
+			return nil, err
 		}
 		remaining := maxTextBytes - int64(buf.Len())
 		if remaining <= 0 {
@@ -201,6 +196,33 @@ func (p Page) Font(name string) Font {
 	return Font{p.Resources().Key("Font").Key(name), nil}
 }
 
+// fontTable maps the page's font names to fonts. Font names are scoped to a
+// page, so cache shares fonts across pages by object reference; a nil cache
+// shares nothing.
+func (p Page) fontTable(ctx context.Context, cache map[objptr]*Font) (map[string]*Font, error) {
+	fontDict := p.Resources().Key("Font")
+	entries, _ := fontDict.data.(dict)
+	fonts := make(map[string]*Font, len(entries))
+	for _, key := range fontDict.Keys() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Only an indirect reference identifies a font object: a direct dict
+		// carries the reference of the object that contains it.
+		ref, isRef := entries[name(key)].(objptr)
+		if f, ok := cache[ref]; isRef && ok {
+			fonts[key] = f
+			continue
+		}
+		f := &Font{fontDict.Key(key), nil}
+		if isRef && cache != nil {
+			cache[ref] = f
+		}
+		fonts[key] = f
+	}
+	return fonts, nil
+}
+
 // A Font represent a font in a PDF file.
 // The methods interpret a Font dictionary stored in V.
 type Font struct {
@@ -251,11 +273,17 @@ func (f Font) Encoder() TextEncoding {
 
 // encoder is like Encoder but honors ctx while parsing a ToUnicode CMap, which
 // can be arbitrarily large in a malicious font.
-func (f Font) encoder(ctx context.Context) TextEncoding {
-	if f.enc == nil { // caching the Encoder so we don't have to continually parse charmap
-		f.enc = f.getEncoder(ctx)
+func (f *Font) encoder(ctx context.Context) TextEncoding {
+	if f.enc != nil {
+		return f.enc
 	}
-	return f.enc
+	enc := f.getEncoder(ctx)
+	// A parse cut short by cancellation yields a degraded encoder; keep it out
+	// of the cache so a later call with a live context parses the map fully.
+	if ctx.Err() == nil {
+		f.enc = enc
+	}
+	return enc
 }
 
 func (f Font) getEncoder(ctx context.Context) TextEncoding {
@@ -626,10 +654,9 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 	var enc TextEncoding = &nopEncoder{}
 
 	if fonts == nil {
-		fonts = make(map[string]*Font)
-		for _, font := range p.Fonts() {
-			f := p.Font(font)
-			fonts[font] = &f
+		var err error
+		if fonts, err = p.fontTable(ctx, nil); err != nil {
+			return "", err
 		}
 	}
 
@@ -884,11 +911,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	strm := p.V.Key("Contents")
 
-	fonts := make(map[string]*Font)
-	for _, font := range p.Fonts() {
-		f := p.Font(font)
-		fonts[font] = &f
-	}
+	fonts, _ := p.fontTable(context.Background(), nil)
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
