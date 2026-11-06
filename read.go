@@ -224,6 +224,16 @@ func readXref(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	return nil, objptr{}, nil, fmt.Errorf("malformed PDF: cross-reference table not found: %v", tok)
 }
 
+// visitPrev records off as a visited xref section, so a Prev chain that
+// loops back on itself ends with an error.
+func visitPrev(seen map[int64]bool, off int64) error {
+	if seen[off] {
+		return fmt.Errorf("malformed PDF: xref Prev repeats offset %d", off)
+	}
+	seen[off] = true
+	return nil
+}
+
 func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	obj1 := b.readObject()
 	obj, ok := obj1.(objdef)
@@ -255,10 +265,9 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 		if !ok {
 			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
 		}
-		if seen[off] {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev repeats offset %d", off)
+		if err := visitPrev(seen, off); err != nil {
+			return nil, objptr{}, nil, err
 		}
-		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		obj1 := b.readObject()
 		obj, ok := obj1.(objdef)
@@ -390,10 +399,9 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 		if !ok {
 			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
 		}
-		if seen[off] {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev repeats offset %d", off)
+		if err := visitPrev(seen, off); err != nil {
+			return nil, objptr{}, nil, err
 		}
-		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		tok := b.readToken()
 		if tok != keyword("xref") {
