@@ -521,13 +521,12 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 		case "beginbfchar":
 			n = int(stk.Pop().Int64())
 		case "endbfchar":
+			// A stray end operator has no entries of its own to read. Each entry
+			// consumes 2 operands (3 for bfrange), so the stack bounds the count.
 			if n < 0 {
-				panic("missing beginbfchar")
+				return
 			}
-			// Each entry consumes two operands, so the stack bounds the count.
-			if avail := stk.Len() / 2; n > avail {
-				n = avail
-			}
+			n = min(n, stk.Len()/2)
 			for i := 0; i < n; i++ {
 				if err := ctx.Err(); err != nil {
 					ok = false
@@ -541,12 +540,9 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 			n = int(stk.Pop().Int64())
 		case "endbfrange":
 			if n < 0 {
-				panic("missing beginbfrange")
+				return
 			}
-			// Each entry consumes three operands, so the stack bounds the count.
-			if avail := stk.Len() / 3; n > avail {
-				n = avail
-			}
+			n = min(n, stk.Len()/3)
 			for i := 0; i < n; i++ {
 				if err := ctx.Err(); err != nil {
 					ok = false
