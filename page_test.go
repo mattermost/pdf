@@ -11,15 +11,11 @@ import (
 // cmapPDF builds a one-page PDF whose /F1 font carries the given ToUnicode
 // character map and whose content stream is content.
 func cmapPDF(cmap, content string) []byte {
-	return classicPDF([]string{
-		"",
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+	return buildPagePDF("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>",
 		streamObj(content),
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Mapped /ToUnicode 6 0 R >>",
 		streamObj(cmap),
-	}, "")
+	)
 }
 
 // cmapSource wraps the body of a character map in the usual preamble.
@@ -321,14 +317,10 @@ func TestDifferencesTable(t *testing.T) {
 }
 
 func TestDifferencesEncodingDecodesText(t *testing.T) {
-	data := classicPDF([]string{
-		"",
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+	data := buildPagePDF("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>",
 		streamObj("BT /F1 12 Tf (AB) Tj ET"),
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Mapped /Encoding << /Type /Encoding /Differences [65 /adieresis /ccedilla] >> >>",
-	}, "")
+	)
 
 	text, err := extract(t, data)
 	if err != nil {
@@ -343,17 +335,12 @@ func TestPageWithSeveralFonts(t *testing.T) {
 	font := func(first string) string {
 		return "<< /Type /Font /Subtype /Type1 /BaseFont /Mapped /Encoding << /Differences [65 /" + first + "] >> >>"
 	}
-	data := classicPDF([]string{
-		"",
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R " +
-			"/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> >>",
+	data := buildPagePDF("/Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >>",
 		streamObj("BT /F1 12 Tf (A) Tj /F2 12 Tf (A) Tj /F3 12 Tf (A) Tj ET"),
 		font("adieresis"),
 		font("ccedilla"),
 		font("bullet"),
-	}, "")
+	)
 
 	text, err := extract(t, data)
 	if err != nil {
@@ -421,10 +408,6 @@ func manyFontsPDF(n int) []byte {
 	content.WriteString("ET")
 
 	objs := []string{
-		"",
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources 5 0 R >>",
 		streamObj(content.String()),
 		"<< /Font 6 0 R >>",
 		"<< " + names.String() + ">>",
@@ -432,7 +415,7 @@ func manyFontsPDF(n int) []byte {
 	for i := 0; i < n; i++ {
 		objs = append(objs, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 	}
-	return classicPDF(objs, "")
+	return buildPagePDF("/Contents 4 0 R /Resources 5 0 R", objs...)
 }
 
 // errAfterCtx reports cancellation once Err has been called n times.

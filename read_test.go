@@ -246,9 +246,7 @@ func objStm(ids []int, bodies []string, n, pad int, extra string) string {
 // a parser that never returns as a test failure.
 func extract(t *testing.T, data []byte) (text string, err error) {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
+	withinTimeout(t, func() {
 		defer func() {
 			if r := recover(); r != nil {
 				if e, ok := r.(error); ok {
@@ -270,12 +268,7 @@ func extract(t *testing.T, data []byte) (text string, err error) {
 		}
 		b, rderr := io.ReadAll(rd)
 		text, err = string(b), rderr
-	}()
-	select {
-	case <-done:
-	case <-time.After(testTimeout):
-		t.Fatal("extraction did not finish")
-	}
+	})
 	return text, err
 }
 
