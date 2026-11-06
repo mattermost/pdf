@@ -28,8 +28,15 @@ const maxTextBytes = 1024 * 1024 * 1 // 1MB
 func (r *Reader) Page(num int) Page {
 	num-- // now 0-indexed
 	page := r.Trailer().Key("Root").Key("Pages")
+	seen := map[objptr]bool{}
 Search:
 	for page.Key("Type").Name() == "Pages" {
+		if page.ptr != (objptr{}) {
+			if seen[page.ptr] {
+				return Page{}
+			}
+			seen[page.ptr] = true
+		}
 		count := int(page.Key("Count").Int64())
 		if count < num {
 			return Page{}
@@ -71,7 +78,9 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 	}
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	fonts := make(map[string]*Font)
+	// Font names are scoped to a page, so the cross-page cache is keyed by the
+	// font object and each page gets its own name table.
+	fontCache := make(map[objptr]*Font)
 	for i := 1; i <= pages; i++ {
 		select {
 		case <-ctx.Done():
@@ -79,11 +88,9 @@ func (r *Reader) GetPlainText(ctx context.Context) (reader io.Reader, err error)
 		default:
 		}
 		p := r.Page(i)
-		for _, name := range p.Fonts() { // cache fonts so we don't continually parse charmap
-			if _, ok := fonts[name]; !ok {
-				f := p.Font(name)
-				fonts[name] = &f
-			}
+		fonts, err := p.fontTable(ctx, fontCache)
+		if err != nil {
+			return nil, err
 		}
 		remaining := maxTextBytes - int64(buf.Len())
 		if remaining <= 0 {
@@ -142,11 +149,17 @@ func (r *Reader) GetStyledTexts(ctx context.Context) (sentences []Text, err erro
 	return sentences, err
 }
 
+// maxPageTreeDepth bounds the walk up a page's Parent chain. Real page trees
+// are broad and shallow, so a chain this long does not describe one.
+const maxPageTreeDepth = 100
+
 func (p Page) findInherited(key string) Value {
-	for v := p.V; !v.IsNull(); v = v.Key("Parent") {
+	v := p.V
+	for depth := 0; depth < maxPageTreeDepth && !v.IsNull(); depth++ {
 		if r := v.Key(key); !r.IsNull() {
 			return r
 		}
+		v = v.Key("Parent")
 	}
 	return Value{}
 }
@@ -174,6 +187,33 @@ func (p Page) Fonts() []string {
 // Font returns the font with the given name associated with the page.
 func (p Page) Font(name string) Font {
 	return Font{p.Resources().Key("Font").Key(name), nil}
+}
+
+// fontTable maps the page's font names to fonts. Font names are scoped to a
+// page, so cache shares fonts across pages by object reference; a nil cache
+// shares nothing.
+func (p Page) fontTable(ctx context.Context, cache map[objptr]*Font) (map[string]*Font, error) {
+	fontDict := p.Resources().Key("Font")
+	entries, _ := fontDict.data.(dict)
+	fonts := make(map[string]*Font, len(entries))
+	for _, key := range fontDict.Keys() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Only an indirect reference identifies a font object: a direct dict
+		// carries the reference of the object that contains it.
+		ref, isRef := entries[name(key)].(objptr)
+		if f, ok := cache[ref]; isRef && ok {
+			fonts[key] = f
+			continue
+		}
+		f := &Font{fontDict.Key(key), nil}
+		if isRef && cache != nil {
+			cache[ref] = f
+		}
+		fonts[key] = f
+	}
+	return fonts, nil
 }
 
 // A Font represent a font in a PDF file.
@@ -226,11 +266,17 @@ func (f Font) Encoder() TextEncoding {
 
 // encoder is like Encoder but honors ctx while parsing a ToUnicode CMap, which
 // can be arbitrarily large in a malicious font.
-func (f Font) encoder(ctx context.Context) TextEncoding {
-	if f.enc == nil { // caching the Encoder so we don't have to continually parse charmap
-		f.enc = f.getEncoder(ctx)
+func (f *Font) encoder(ctx context.Context) TextEncoding {
+	if f.enc != nil {
+		return f.enc
 	}
-	return f.enc
+	enc := f.getEncoder(ctx)
+	// A parse cut short by cancellation yields a degraded encoder; keep it out
+	// of the cache so a later call with a live context parses the map fully.
+	if ctx.Err() == nil {
+		f.enc = enc
+	}
+	return enc
 }
 
 func (f Font) getEncoder(ctx context.Context) TextEncoding {
@@ -251,7 +297,7 @@ func (f Font) getEncoder(ctx context.Context) TextEncoding {
 			return &nopEncoder{}
 		}
 	case Dict:
-		return &dictEncoder{enc.Key("Differences")}
+		return &byteEncoder{differencesTable(enc.Key("Differences"))}
 	case Null:
 		return f.charmapEncoding(ctx)
 	default:
@@ -275,35 +321,32 @@ func (f *Font) charmapEncoding(ctx context.Context) TextEncoding {
 	return &byteEncoder{&pdfDocEncoding}
 }
 
-type dictEncoder struct {
-	v Value
-}
-
-func (e *dictEncoder) Decode(raw string) (text string) {
-	r := make([]rune, 0, len(raw))
-	for i := 0; i < len(raw); i++ {
-		ch := rune(raw[i])
-		n := -1
-		for j := 0; j < e.v.Len(); j++ {
-			x := e.v.Index(j)
-			if x.Kind() == Integer {
-				n = int(x.Int64())
-				continue
-			}
-			if x.Kind() == Name {
-				if int(raw[i]) == n {
-					r := nameToRune[x.Name()]
-					if r != 0 {
-						ch = r
-						break
-					}
-				}
-				n++
-			}
-		}
-		r = append(r, ch)
+// differencesTable turns an Encoding Differences array into a code-point
+// table: every code maps to itself unless a name in the array claims it, and
+// the first name that maps to a known rune keeps the code.
+func differencesTable(differences Value) *[256]rune {
+	table := new([256]rune)
+	var assigned [256]bool
+	for i := range table {
+		table[i] = rune(i)
 	}
-	return string(r)
+	code := -1
+	for j := 0; j < differences.Len(); j++ {
+		x := differences.Index(j)
+		switch x.Kind() {
+		case Integer:
+			code = int(x.Int64())
+		case Name:
+			if code >= 0 && code < 256 && !assigned[code] {
+				if r := nameToRune[x.Name()]; r != 0 {
+					table[code] = r
+					assigned[code] = true
+				}
+			}
+			code++
+		}
+	}
+	return table
 }
 
 // A TextEncoding represents a mapping between
@@ -356,9 +399,32 @@ type cmap struct {
 }
 
 func (m *cmap) Decode(raw string) (text string) {
+	return m.decodeContext(context.Background(), raw)
+}
+
+// contextDecoder is a TextEncoding whose decoding cost grows with the size of
+// the font's tables, so it honors ctx.
+type contextDecoder interface {
+	decodeContext(ctx context.Context, raw string) string
+}
+
+// decodeText decodes raw with enc, honoring ctx when enc supports it.
+func decodeText(ctx context.Context, enc TextEncoding, raw string) string {
+	if d, ok := enc.(contextDecoder); ok {
+		return d.decodeContext(ctx, raw)
+	}
+	return enc.Decode(raw)
+}
+
+// decodeContext is like Decode but stops early when ctx is done: the
+// per-character scan over the map's tables can be long for a large map.
+func (m *cmap) decodeContext(ctx context.Context, raw string) string {
 	var r []rune
 Parse:
 	for len(raw) > 0 {
+		if ctx.Err() != nil {
+			break
+		}
 		for n := 1; n <= 4 && n <= len(raw); n++ { // number of digits in character replacement (1-4 possible)
 			for _, space := range m.space[n-1] { // find matching codespace Ranges for number of digits
 				if space.low <= raw[:n] && raw[:n] <= space.high { // see if value is in range
@@ -462,9 +528,12 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 		case "beginbfchar":
 			n = int(stk.Pop().Int64())
 		case "endbfchar":
+			// A stray end operator has no entries of its own to read. Each entry
+			// consumes 2 operands (3 for bfrange), so the stack bounds the count.
 			if n < 0 {
-				panic("missing beginbfchar")
+				return
 			}
+			n = min(n, stk.Len()/2)
 			for i := 0; i < n; i++ {
 				if err := ctx.Err(); err != nil {
 					ok = false
@@ -473,12 +542,14 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfchar = append(m.bfchar, bfchar{orig, repl})
 			}
+			n = -1
 		case "beginbfrange":
 			n = int(stk.Pop().Int64())
 		case "endbfrange":
 			if n < 0 {
-				panic("missing beginbfrange")
+				return
 			}
+			n = min(n, stk.Len()/3)
 			for i := 0; i < n; i++ {
 				if err := ctx.Err(); err != nil {
 					ok = false
@@ -487,6 +558,7 @@ func readCmap(ctx context.Context, toUnicode Value) *cmap {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
 			}
+			n = -1
 		case "defineresource":
 			stk.Pop().Name() // category
 			value := stk.Pop()
@@ -585,10 +657,9 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 	var enc TextEncoding = &nopEncoder{}
 
 	if fonts == nil {
-		fonts = make(map[string]*Font)
-		for _, font := range p.Fonts() {
-			f := p.Font(font)
-			fonts[font] = &f
+		var err error
+		if fonts, err = p.fontTable(ctx, nil); err != nil {
+			return "", err
 		}
 	}
 
@@ -613,7 +684,7 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 		if capped {
 			return
 		}
-		for _, ch := range enc.Decode(s) {
+		for _, ch := range decodeText(ctx, enc, s) {
 			if limit > 0 && int64(textBuilder.Len()) >= limit {
 				capped = true
 				cancel()
@@ -837,11 +908,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	strm := p.V.Key("Contents")
 
-	fonts := make(map[string]*Font)
-	for _, font := range p.Fonts() {
-		f := p.Font(font)
-		fonts[font] = &f
-	}
+	fonts, _ := p.fontTable(context.Background(), nil)
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
@@ -931,7 +998,7 @@ func (p Page) Content(ctx context.Context) (result Content, err error) {
 	var text []Text
 	showText := func(s string) {
 		n := 0
-		decoded := enc.Decode(s)
+		decoded := decodeText(ctx, enc, s)
 		for _, ch := range decoded {
 			var w0 float64
 			if n < len(s) {
