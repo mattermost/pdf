@@ -270,8 +270,8 @@ func TestCmapDecodeStopsWhenContextDone(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := m.decode(ctx, "A"); got != "" {
-		t.Fatalf("decode = %q, want no text", got)
+	if got := m.decodeContext(ctx, "A"); got != "" {
+		t.Fatalf("decodeContext = %q, want no text", got)
 	}
 }
 

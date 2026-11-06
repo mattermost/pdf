@@ -406,12 +406,26 @@ type cmap struct {
 }
 
 func (m *cmap) Decode(raw string) (text string) {
-	return m.decode(context.Background(), raw)
+	return m.decodeContext(context.Background(), raw)
 }
 
-// decode is like Decode but stops early when ctx is done: the per-character
-// scan over the map's tables can be long for a large map.
-func (m *cmap) decode(ctx context.Context, raw string) (text string) {
+// contextDecoder is a TextEncoding whose decoding cost grows with the size of
+// the font's tables, so it honors ctx.
+type contextDecoder interface {
+	decodeContext(ctx context.Context, raw string) string
+}
+
+// decodeText decodes raw with enc, honoring ctx when enc supports it.
+func decodeText(ctx context.Context, enc TextEncoding, raw string) string {
+	if d, ok := enc.(contextDecoder); ok {
+		return d.decodeContext(ctx, raw)
+	}
+	return enc.Decode(raw)
+}
+
+// decodeContext is like Decode but stops early when ctx is done: the
+// per-character scan over the map's tables can be long for a large map.
+func (m *cmap) decodeContext(ctx context.Context, raw string) string {
 	var r []rune
 Parse:
 	for len(raw) > 0 {
@@ -677,13 +691,7 @@ func (p Page) GetPlainText(ctx context.Context, fonts map[string]*Font, limit in
 		if capped {
 			return
 		}
-		var decoded string
-		if m, ok := enc.(*cmap); ok {
-			decoded = m.decode(ctx, s)
-		} else {
-			decoded = enc.Decode(s)
-		}
-		for _, ch := range decoded {
+		for _, ch := range decodeText(ctx, enc, s) {
 			if limit > 0 && int64(textBuilder.Len()) >= limit {
 				capped = true
 				cancel()
@@ -997,7 +1005,7 @@ func (p Page) Content(ctx context.Context) (result Content, err error) {
 	var text []Text
 	showText := func(s string) {
 		n := 0
-		decoded := enc.Decode(s)
+		decoded := decodeText(ctx, enc, s)
 		for _, ch := range decoded {
 			var w0 float64
 			if n < len(s) {
