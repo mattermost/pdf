@@ -154,15 +154,8 @@ func (r *Reader) GetStyledTexts(ctx context.Context) (sentences []Text, err erro
 const maxPageTreeDepth = 100
 
 func (p Page) findInherited(key string) Value {
-	seen := map[objptr]bool{}
 	v := p.V
 	for depth := 0; depth < maxPageTreeDepth && !v.IsNull(); depth++ {
-		if v.ptr != (objptr{}) {
-			if seen[v.ptr] {
-				return Value{}
-			}
-			seen[v.ptr] = true
-		}
 		if r := v.Key(key); !r.IsNull() {
 			return r
 		}
