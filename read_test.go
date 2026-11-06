@@ -318,6 +318,31 @@ func TestXrefTablePrevRepeatedOffset(t *testing.T) {
 	})
 }
 
+func TestXrefTablePrevMutualCycle(t *testing.T) {
+	objs := append([]string{}, pageObjs...)
+	objs[4] = streamObj("BT /F1 12 Tf (hi) Tj ET")
+	// The fixed-width placeholder is patched below without moving any offset.
+	const placeholder = "0000000000"
+	base := classicPDF(objs, " /Prev "+placeholder)
+	firstXref := strings.LastIndex(string(base), "xref\n0 ")
+
+	var pdf bytes.Buffer
+	pdf.Write(base)
+	xref2 := pdf.Len()
+	fmt.Fprintf(&pdf, "xref\n0 1\n0000000000 65535 f \n")
+	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n",
+		len(objs), firstXref, xref2)
+
+	data := bytes.Replace(pdf.Bytes(), []byte("/Prev "+placeholder), []byte(fmt.Sprintf("/Prev %010d", xref2)), 1)
+
+	withinTimeout(t, func() {
+		_, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err == nil || !strings.Contains(err.Error(), "Prev repeats offset") {
+			t.Errorf("err = %v, want an xref Prev offset error", err)
+		}
+	})
+}
+
 func TestXrefTableIncrementalUpdate(t *testing.T) {
 	objs := append([]string{}, pageObjs...)
 	objs[4] = streamObj("BT /F1 12 Tf (first) Tj ET")
@@ -533,6 +558,45 @@ func TestObjectStreamExtendsChainRepeats(t *testing.T) {
 	_, err := extract(t, data)
 	if err == nil || !strings.Contains(err.Error(), "extends itself") {
 		t.Fatalf("err = %v, want an Extends chain error", err)
+	}
+}
+
+// extendsChainPDF stores the catalog at the end of an acyclic Extends chain
+// of hops links, while the xref names the first stream of the chain as its
+// container.
+func extendsChainPDF(hops int) []byte {
+	first := 4
+	content := first + hops + 1
+	objs := []string{
+		"", "",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents %d 0 R /Resources << /Font << /F1 %d 0 R >> >> >>", content, content+1),
+	}
+	for i := 0; i < hops; i++ {
+		objs = append(objs, objStm([]int{100 + i}, []string{"null"}, -1, 0, fmt.Sprintf(" /Extends %d 0 R", first+i+1)))
+	}
+	objs = append(objs,
+		objStm([]int{1}, []string{"<< /Type /Catalog /Pages 2 0 R >>"}, -1, 0, ""),
+		streamObj("BT /F1 12 Tf (chain end) Tj ET"),
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	)
+	return xrefStreamPDF(objs, map[int][2]int{1: {first, 0}})
+}
+
+func TestObjectStreamExtendsChainAtLimit(t *testing.T) {
+	text, err := extract(t, extendsChainPDF(maxObjStmExtends))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "chain end") {
+		t.Fatalf("text = %q, want the page content", text)
+	}
+}
+
+func TestObjectStreamExtendsChainBeyondLimit(t *testing.T) {
+	_, err := extract(t, extendsChainPDF(maxObjStmExtends+1))
+	if err == nil || !strings.Contains(err.Error(), "Extends chain exceeds") {
+		t.Fatalf("err = %v, want an Extends hop limit error", err)
 	}
 }
 

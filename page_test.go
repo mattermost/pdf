@@ -58,6 +58,22 @@ func TestPageTreeKidsRepeatedNode(t *testing.T) {
 	}
 }
 
+func TestPageTreeKidsSelfReference(t *testing.T) {
+	data := classicPDF([]string{
+		"",
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [2 0 R] /Count 1 >>",
+	}, "")
+
+	text, err := extract(t, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "" {
+		t.Fatalf("text = %q, want no text", text)
+	}
+}
+
 func TestPageTreeNestedResolves(t *testing.T) {
 	data := classicPDF([]string{
 		"",
